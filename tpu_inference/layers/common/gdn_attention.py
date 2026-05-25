@@ -24,9 +24,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 import tpu_inference.layers.common.ragged_gated_delta_rule_wrapper as ragged_gated_delta_rule_wrapper
-from tpu_inference.kernels.causal_conv1d import causal_conv1d
-from tpu_inference.layers.common.ragged_gated_delta_rule_ref import \
-    ragged_gated_delta_rule as ragged_gated_delta_rule_ref
+from tpu_inference.kernels.fused_conv1d_gdn import wrapper
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
 
@@ -101,71 +99,29 @@ def run_jax_gdn_attention_local(
         - A tuple of (new_conv_state, new_recurrent_state).
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
-    # has_initial_state[i] = True iff request i already has computed
-    # tokens in its mamba slot (chunked-prefill continuation, prefix-cache
-    # hit, or running decode). False for brand-new prefills, in which
-    # case the conv1d, the chunked / ref delta-rule impls, and the fused
-    # Pallas recurrent kernel all zero the slot's prior state before
-    # the update so a freshly-allocated mamba slot can't leak its
-    # previous tenant's state. context_len = seq_len - query_len.
-    max_reqs = seq_lens.shape[0]
-    query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
-    has_initial_state = (seq_lens - query_lens) > 0
 
-    out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
+    (new_conv_state, new_recurrent_state), out = wrapper.fused_conv1d_gdn(
         mixed_qkv,
+        b,
+        a,
         conv_state,
+        recurrent_state,
         conv_weight,
         conv_bias,
+        A_log,
+        dt_bias,
         query_start_loc,
         state_indices,
         distribution,
-        has_initial_state,
-        kernel_size=kernel_size,
+        seq_lens,
+        n_kq,
+        n_v,
+        d_k,
+        d_v,
+        kernel_size,
     )
 
-    if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.REF:
-        ragged_gdn_impl = functools.partial(
-            ragged_gated_delta_rule_ref,
-            has_initial_state=has_initial_state,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-        )
-        new_recurrent_state, output = ragged_gdn_impl(
-            out_mixed_qkv,
-            b,
-            a,
-            recurrent_state,
-            A_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-        )
-    else:
-        wrapper_config = config.ragged_gated_delta_rule_impl.to_config()
-        new_recurrent_state, output = ragged_gated_delta_rule_wrapper.ragged_gated_delta_rule_wrapper(
-            mixed_qkv=out_mixed_qkv,
-            b=b,
-            a=a,
-            recurrent_state=recurrent_state,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            query_start_loc=query_start_loc,
-            state_indices=state_indices,
-            distribution=distribution,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            config=wrapper_config,
-            chunk_size=32,
-            has_initial_state=has_initial_state,
-        )
-
-    return (new_conv_state, new_recurrent_state), output
+    return (new_conv_state, new_recurrent_state), out
 
 
 def run_jax_gdn_attention(
