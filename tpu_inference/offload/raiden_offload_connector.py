@@ -620,7 +620,6 @@ class RaidenOffloadConnectorScheduler:
 
             for req_id, loaded_chunks in stats.data["finished_load_chunks"].items():
                 self.staging_buffer_manager.free(req_id, usage="load", num_finished_blocks=len(loaded_chunks))
-                self.lru_manager.mark_completion(loaded_chunks, "load")
                 for chunk_id in loaded_chunks:
                     self._reqs_being_loaded[req_id].discard(chunk_id)
                 if not self._reqs_being_loaded[req_id]:
