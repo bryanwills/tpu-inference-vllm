@@ -313,6 +313,10 @@ class RaidenLRUCacheManager(LRUCacheManager):
             if self.kv_store is not None:
                 self.kv_store.delete([evicting_chunk_hash], [[]])
 
+        if to_evict:
+            logger.info(f"[RaidenOffload] Evicted {len(to_evict)} local LRU CPU chunks to reclaim physical slots.")
+            TPUKVCacheMetrics.get_or_create().record_eviction(len(to_evict))
+
         new_chunk_hashes = [chunk_hashes[i] for i in new_chunk_idxs]
         try:
             new_chunks = self.chunk_pool.allocate_chunks(new_chunk_hashes)
@@ -337,7 +341,7 @@ class RaidenOffloadConnectorScheduler:
             )
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
-        self.num_cpu_chunks = envs.TPU_OFFLOAD_NUM_CPU_CHUNKS
+        self.num_cpu_chunks = int(os.getenv("TPU_OFFLOAD_NUM_CPU_CHUNKS", 65536))
         
         self.job_name = os.getenv("RAIDEN_JOB_NAME", "tpu_inference")
         self.job_replica_id = os.getenv("CLOUD_TPU_TASK_ID", "0")
@@ -423,8 +427,8 @@ class RaidenOffloadConnectorScheduler:
         stats = self.metrics_collector.get_cumulative_stats()
         total_tokens = stats.lookup_hits + stats.lookup_miss
         hit_rate = (stats.lookup_hits / total_tokens * 100.0) if total_tokens > 0 else 0.0
-        logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Queries: {stats.lookup_requests})")
-        print(f"[RaidenOffload] Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Queries: {stats.lookup_requests})", flush=True)
+        logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})")
+        print(f"[RaidenOffload] Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})", flush=True)
         
         num_matched_for_scheduler = num_matched_tokens
         if num_matched_tokens > 0 and num_matched_tokens == request.num_tokens:

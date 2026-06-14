@@ -56,6 +56,7 @@ class TPUKVCacheStats:
     host_memory_usage_bytes: int = 0
     staging_buffer_usage_blocks: int = 0
     staging_buffer_free_blocks: int = 0
+    evictions: int = 0
 
 
 class TPUKVCacheMetrics:
@@ -76,6 +77,11 @@ class TPUKVCacheMetrics:
         self._lookup_requests: int = 0
         self._lookup_hits: int = 0
         self._lookup_miss: int = 0
+        self._interval_evictions: int = 0
+        self._cumulative_lookup_requests: int = 0
+        self._cumulative_lookup_hits: int = 0
+        self._cumulative_lookup_miss: int = 0
+        self._cumulative_evictions: int = 0
         self._d2h_operations: int = 0
         self._d2h_bytes: List[int] = []
         self._d2h_transfer_latencies: List[float] = []
@@ -106,14 +112,22 @@ class TPUKVCacheMetrics:
     def record_lookup_request(self):
         with self._instance_lock:
             self._lookup_requests += 1
+            self._cumulative_lookup_requests += 1
 
     def record_cache_hit(self, tokens: int):
         with self._instance_lock:
             self._lookup_hits += tokens
+            self._cumulative_lookup_hits += tokens
 
     def record_cache_miss(self, tokens: int):
         with self._instance_lock:
             self._lookup_miss += tokens
+            self._cumulative_lookup_miss += tokens
+
+    def record_eviction(self, count: int):
+        with self._instance_lock:
+            self._interval_evictions += count
+            self._cumulative_evictions += count
 
     def record_d2h_operation(self):
         with self._instance_lock:
@@ -163,6 +177,7 @@ class TPUKVCacheMetrics:
         self._lookup_requests = 0
         self._lookup_hits = 0
         self._lookup_miss = 0
+        self._interval_evictions = 0
         self._d2h_operations = 0
         self._d2h_bytes.clear()
         self._d2h_transfer_latencies.clear()
@@ -178,9 +193,10 @@ class TPUKVCacheMetrics:
     def get_cumulative_stats(self) -> TPUKVCacheStats:
         with self._instance_lock:
             stats = TPUKVCacheStats(
-                lookup_requests=self._lookup_requests,
-                lookup_hits=self._lookup_hits,
-                lookup_miss=self._lookup_miss,
+                lookup_requests=self._cumulative_lookup_requests,
+                lookup_hits=self._cumulative_lookup_hits,
+                lookup_miss=self._cumulative_lookup_miss,
+                evictions=self._cumulative_evictions,
                 d2h_operations=self._d2h_operations,
                 d2h_bytes=list(self._d2h_bytes),
                 d2h_transfer_latencies=list(self._d2h_transfer_latencies),
@@ -201,6 +217,7 @@ class TPUKVCacheMetrics:
                 lookup_requests=self._lookup_requests,
                 lookup_hits=self._lookup_hits,
                 lookup_miss=self._lookup_miss,
+                evictions=self._interval_evictions,
                 d2h_operations=self._d2h_operations,
                 d2h_bytes=list(self._d2h_bytes),
                 d2h_transfer_latencies=list(self._d2h_transfer_latencies),
