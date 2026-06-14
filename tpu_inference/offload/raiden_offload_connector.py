@@ -432,8 +432,8 @@ class RaidenOffloadConnectorScheduler:
             stats = self.metrics_collector.get_cumulative_stats()
             total_tokens = stats.lookup_hits + stats.lookup_miss
             hit_rate = (stats.lookup_hits / total_tokens * 100.0) if total_tokens > 0 else 0.0
-            logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})")
-            print(f"[RaidenOffload] Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})", flush=True)
+            logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Inserts: {stats.insertions}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})")
+            print(f"[RaidenOffload] Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Inserts: {stats.insertions}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})", flush=True)
         
         num_matched_for_scheduler = num_matched_tokens
         if num_matched_tokens > 0 and num_matched_tokens == request.num_tokens:
@@ -617,6 +617,7 @@ class RaidenOffloadConnectorScheduler:
                         if RaidenId is not None and self.kv_store is not None:
                             raiden_id = locator.to_raiden_id()
                             self.kv_store.insert([h], [[raiden_id]], on_host=True)
+                            self.metrics_collector.record_insertion(1)
                         completed_items.append(item)
                 
                 for item in completed_items:
@@ -734,24 +735,26 @@ class RaidenOffloadConnectorWorker:
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         completed = []
+        finished_saves = set()
         for item in self._pending_saves:
             future, req_id, chunks, hashes, locators = item
-            if future.done():
-                try:
-                    future.result()
-                    self.offload_stats.record_save(req_id, chunks)
-                    if self.kv_store is not None and RaidenId is not None:
-                        for h, locator in zip(hashes, locators):
-                            raiden_id = locator.to_raiden_id()
-                            self.kv_store.insert([h], [[raiden_id]], on_host=True)
-                except Exception as e:
-                    logger.error(f"Failed to save Raiden chunks for {req_id}: {e}")
-                completed.append(item)
+            try:
+                future.result()  # Synchronous wait ensuring save fully completes during this active model execution step!
+                self.offload_stats.record_save(req_id, chunks)
+                finished_saves.add(req_id)
+                if self.kv_store is not None and RaidenId is not None:
+                    for h, locator in zip(hashes, locators):
+                        raiden_id = locator.to_raiden_id()
+                        self.kv_store.insert([h], [[raiden_id]], on_host=True)
+                TPUKVCacheMetrics.get_or_create().record_insertion(len(hashes))
+            except Exception as e:
+                logger.error(f"Failed to save Raiden chunks for {req_id}: {e}")
+            completed.append(item)
         
         for item in completed:
             self._pending_saves.remove(item)
 
-        return set(), set()
+        return finished_saves, set()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         return self.offload_stats.clone_and_reset()

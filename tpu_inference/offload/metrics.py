@@ -57,6 +57,7 @@ class TPUKVCacheStats:
     staging_buffer_usage_blocks: int = 0
     staging_buffer_free_blocks: int = 0
     evictions: int = 0
+    insertions: int = 0
 
 
 class TPUKVCacheMetrics:
@@ -82,6 +83,7 @@ class TPUKVCacheMetrics:
         self._cumulative_lookup_hits: int = 0
         self._cumulative_lookup_miss: int = 0
         self._cumulative_evictions: int = 0
+        self._cumulative_insertions: int = 0
         self._d2h_operations: int = 0
         self._d2h_bytes: List[int] = []
         self._d2h_transfer_latencies: List[float] = []
@@ -128,6 +130,10 @@ class TPUKVCacheMetrics:
         with self._instance_lock:
             self._interval_evictions += count
             self._cumulative_evictions += count
+
+    def record_insertion(self, count: int = 1):
+        with self._instance_lock:
+            self._cumulative_insertions += count
 
     def record_d2h_operation(self):
         with self._instance_lock:
@@ -197,6 +203,7 @@ class TPUKVCacheMetrics:
                 lookup_hits=self._cumulative_lookup_hits,
                 lookup_miss=self._cumulative_lookup_miss,
                 evictions=self._cumulative_evictions,
+                insertions=self._cumulative_insertions,
                 d2h_operations=self._d2h_operations,
                 d2h_bytes=list(self._d2h_bytes),
                 d2h_transfer_latencies=list(self._d2h_transfer_latencies),
