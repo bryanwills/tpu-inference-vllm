@@ -367,6 +367,7 @@ class RaidenOffloadConnectorScheduler:
         self._reqs_being_saved = defaultdict[ReqId, set[CpuChunkId]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[CpuChunkId]](set)
         self.metrics_collector = TPUKVCacheMetrics.get_or_create()
+        self._recorded_metrics_reqs: set[ReqId] = set()
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         if self.kv_store is None:
@@ -421,14 +422,17 @@ class RaidenOffloadConnectorScheduler:
                 self.staging_buffer_manager.allocate(request.request_id, num_blocks=num_blocks_to_load, usage="load")
 
         self._external_cache_hits[request.request_id] = num_matched_tokens
-        self.metrics_collector.record_cache_hit(num_matched_tokens)
-        self.metrics_collector.record_cache_miss(request.num_tokens - num_matched_tokens)
+        
+        if num_computed_tokens == 0 and request.request_id not in self._recorded_metrics_reqs:
+            self._recorded_metrics_reqs.add(request.request_id)
+            self.metrics_collector.record_cache_hit(num_matched_tokens)
+            self.metrics_collector.record_cache_miss(request.num_tokens - num_matched_tokens)
 
-        stats = self.metrics_collector.get_cumulative_stats()
-        total_tokens = stats.lookup_hits + stats.lookup_miss
-        hit_rate = (stats.lookup_hits / total_tokens * 100.0) if total_tokens > 0 else 0.0
-        logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})")
-        print(f"[RaidenOffload] Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})", flush=True)
+            stats = self.metrics_collector.get_cumulative_stats()
+            total_tokens = stats.lookup_hits + stats.lookup_miss
+            hit_rate = (stats.lookup_hits / total_tokens * 100.0) if total_tokens > 0 else 0.0
+            logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})")
+            print(f"[RaidenOffload] Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})", flush=True)
         
         num_matched_for_scheduler = num_matched_tokens
         if num_matched_tokens > 0 and num_matched_tokens == request.num_tokens:
