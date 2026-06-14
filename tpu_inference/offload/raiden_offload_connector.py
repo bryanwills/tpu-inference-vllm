@@ -156,6 +156,30 @@ class KVRaidenConnectorStats(KVConnectorStats):
     def num_finished_blocks(self) -> int:
         return len(self.data["finished_save_chunks"]) + len(self.data["finished_load_chunks"])
 
+    def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+        res = KVRaidenConnectorStats()
+        res.data["finished_save_chunks"] = copy.deepcopy(self.data["finished_save_chunks"])
+        res.data["finished_load_chunks"] = copy.deepcopy(self.data["finished_load_chunks"])
+        if isinstance(other, KVRaidenConnectorStats) and other.data:
+            for req, chunks in other.data.get("finished_save_chunks", {}).items():
+                if req not in res.data["finished_save_chunks"]:
+                    res.data["finished_save_chunks"][req] = []
+                res.data["finished_save_chunks"][req].extend(copy.deepcopy(chunks))
+            for req, chunks in other.data.get("finished_load_chunks", {}).items():
+                if req not in res.data["finished_load_chunks"]:
+                    res.data["finished_load_chunks"][req] = []
+                res.data["finished_load_chunks"][req].extend(copy.deepcopy(chunks))
+        return res
+
+    def reduce(self) -> dict[str, int | float]:
+        return {
+            "saves": sum(len(c) for c in self.data["finished_save_chunks"].values()),
+            "loads": sum(len(c) for c in self.data["finished_load_chunks"].values()),
+        }
+
+    def is_empty(self) -> bool:
+        return not self.data["finished_save_chunks"] and not self.data["finished_load_chunks"]
+
 
 @dataclass
 class RaidenRequestTracker:
