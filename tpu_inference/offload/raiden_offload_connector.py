@@ -429,18 +429,18 @@ class RaidenOffloadConnectorScheduler:
         prev_hit_tokens = self._external_cache_hits.get(request.request_id, 0)
         self._external_cache_hits[request.request_id] = num_matched_tokens
         
-        num_uncomputed = request.num_tokens - request.num_computed_tokens
-        if num_uncomputed > 1:
-            hit_tokens = max(0, num_matched_tokens - prev_hit_tokens)
-            num_batched_blocks = max(1, (num_uncomputed + self.block_size - 1) // self.block_size)
-            miss_tokens = max(0, min(num_uncomputed, num_batched_blocks * self.block_size) - hit_tokens)
-            self.metrics_collector.record_cache_hit(hit_tokens)
-            self.metrics_collector.record_cache_miss(miss_tokens)
+        if request.request_id not in self._recorded_metrics_reqs:
+            self._recorded_metrics_reqs.add(request.request_id)
+            total_hits = num_matched_tokens
+            total_misses = max(0, request.num_tokens - total_hits)
+            self.metrics_collector.record_cache_hit(total_hits)
+            self.metrics_collector.record_cache_miss(total_misses)
 
             stats = self.metrics_collector.get_cumulative_stats()
             total_tokens = stats.lookup_hits + stats.lookup_miss
             hit_rate = (stats.lookup_hits / total_tokens * 100.0) if total_tokens > 0 else 0.0
             logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Inserts: {stats.insertions}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})")
+            print(f"[RaidenOffload] Lookup snapshot for {request.request_id}: Block Hits={num_hits}, Block Misses={num_misses}", flush=True)
             print(f"[RaidenOffload] Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Inserts: {stats.insertions}, Evictions: {stats.evictions}, Queries: {stats.lookup_requests})", flush=True)
         
         num_matched_for_scheduler = num_matched_tokens
@@ -553,6 +553,7 @@ class RaidenOffloadConnectorScheduler:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self.load_specs.pop(finished_req_id, None)
+            self._recorded_metrics_reqs.discard(finished_req_id)
 
         for request in scheduler_output.scheduled_new_reqs:
             req_id = request.req_id
