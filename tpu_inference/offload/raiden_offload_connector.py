@@ -96,6 +96,7 @@ class RaidenSaveSpec:
     src_blocks: list[int]
     dst_chunks: list[int]
     dst_locators: list[RaidenLocator] = field(default_factory=list)
+    block_hashes: list[int] = field(default_factory=list)
     is_final_save: bool = False
     skip_save: bool = False
 
@@ -522,6 +523,7 @@ class RaidenOffloadConnectorScheduler:
                         src_blocks=src_blocks,
                         dst_chunks=dst_chunks,
                         dst_locators=dst_locators,
+                        block_hashes=new_hashes,
                     )
                     self._reqs_being_saved[req_id] |= set(dst_chunks)
                     self.staging_buffer_manager.allocate(tracker.req_id, num_blocks=num_new, usage="save")
@@ -643,12 +645,13 @@ class RaidenOffloadConnectorWorker:
         self.connector = connector
         self.block_size = vllm_config.cache_config.block_size
         self.num_cpu_chunks = envs.TPU_OFFLOAD_NUM_CPU_CHUNKS
+        self.kv_store = KVCacheStore(capacity=self.num_cpu_chunks) if KVCacheStore is not None else None
         
         self.job_replica_id = os.getenv("CLOUD_TPU_TASK_ID", "0")
         self.raiden_manager: Optional[RaidenKVCacheManager] = None
         self.save_executor = ThreadPoolExecutor(max_workers=envs.TPU_OFFLOAD_SAVE_THREADS, thread_name_prefix="raiden_save")
         self.offload_stats = KVRaidenConnectorStats()
-        self._pending_saves: list[Tuple[Future, str, list[int]]] = []
+        self._pending_saves: list[Any] = []
 
     def __del__(self):
         self.save_executor.shutdown(wait=True)
@@ -727,16 +730,20 @@ class RaidenOffloadConnectorWorker:
                 )
                 
                 future = self.save_executor.submit(self.raiden_manager.d2h, src_blocks, dst_chunks)
-                self._pending_saves.append((future, req_id, dst_chunks))
+                self._pending_saves.append((future, req_id, dst_chunks, save_spec.block_hashes, save_spec.dst_locators))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         completed = []
         for item in self._pending_saves:
-            future, req_id, chunks = item
+            future, req_id, chunks, hashes, locators = item
             if future.done():
                 try:
                     future.result()
                     self.offload_stats.record_save(req_id, chunks)
+                    if self.kv_store is not None and RaidenId is not None:
+                        for h, locator in zip(hashes, locators):
+                            raiden_id = locator.to_raiden_id()
+                            self.kv_store.insert([h], [[raiden_id]], on_host=True)
                 except Exception as e:
                     logger.error(f"Failed to save Raiden chunks for {req_id}: {e}")
                 completed.append(item)
