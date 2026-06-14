@@ -428,10 +428,12 @@ class RaidenOffloadConnectorScheduler:
 
         self._external_cache_hits[request.request_id] = num_matched_tokens
         
-        if num_computed_tokens == 0 and request.request_id not in self._recorded_metrics_reqs:
+        if request.get_num_uncomputed_tokens() == 1 and request.request_id not in self._recorded_metrics_reqs:
             self._recorded_metrics_reqs.add(request.request_id)
-            self.metrics_collector.record_cache_hit(num_matched_tokens)
-            self.metrics_collector.record_cache_miss(request.num_tokens - num_matched_tokens)
+            hit_tokens = num_hits * self.block_size
+            miss_tokens = max(0, request.num_tokens - hit_tokens)
+            self.metrics_collector.record_cache_hit(hit_tokens)
+            self.metrics_collector.record_cache_miss(miss_tokens)
 
             stats = self.metrics_collector.get_cumulative_stats()
             total_tokens = stats.lookup_hits + stats.lookup_miss
