@@ -379,6 +379,10 @@ class RaidenOffloadConnectorScheduler:
         raiden_hashes = [to_raiden_hash(h) for h in request.block_hashes]
         matched = self.kv_store.lookup(raiden_hashes)
         num_hits = len(matched)
+        num_misses = len(raiden_hashes) - num_hits
+        logger.debug(f"Raiden KVCacheStore lookup result for {request.request_id}: Block Hits={num_hits}, Block Misses={num_misses}")
+        if num_computed_tokens == 0:
+            print(f"[RaidenOffload] Lookup snapshot for {request.request_id}: Block Hits={num_hits}, Block Misses={num_misses}", flush=True)
         
         if num_hits > 0:
             matched_hashes = [m[0] for m in matched]
