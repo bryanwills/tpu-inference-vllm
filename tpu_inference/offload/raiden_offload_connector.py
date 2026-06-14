@@ -758,7 +758,7 @@ class RaidenOffloadConnectorWorker:
         for item in completed:
             self._pending_saves.remove(item)
 
-        return finished_saves, set()
+        return set(), set()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         return self.offload_stats.clone_and_reset()
