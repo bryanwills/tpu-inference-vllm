@@ -429,10 +429,11 @@ class RaidenOffloadConnectorScheduler:
         prev_hit_tokens = self._external_cache_hits.get(request.request_id, 0)
         self._external_cache_hits[request.request_id] = num_matched_tokens
         
-        if request.get_num_uncomputed_tokens() > 1:
+        num_uncomputed = request.num_tokens - request.num_computed_tokens
+        if num_uncomputed > 1:
             hit_tokens = max(0, num_matched_tokens - prev_hit_tokens)
-            num_batched_blocks = max(1, (request.get_num_uncomputed_tokens() + self.block_size - 1) // self.block_size)
-            miss_tokens = max(0, min(request.get_num_uncomputed_tokens(), num_batched_blocks * self.block_size) - hit_tokens)
+            num_batched_blocks = max(1, (num_uncomputed + self.block_size - 1) // self.block_size)
+            miss_tokens = max(0, min(num_uncomputed, num_batched_blocks * self.block_size) - hit_tokens)
             self.metrics_collector.record_cache_hit(hit_tokens)
             self.metrics_collector.record_cache_miss(miss_tokens)
 
