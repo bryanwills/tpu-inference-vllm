@@ -424,6 +424,7 @@ class RaidenOffloadConnectorScheduler:
         total_tokens = stats.lookup_hits + stats.lookup_miss
         hit_rate = (stats.lookup_hits / total_tokens * 100.0) if total_tokens > 0 else 0.0
         logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Queries: {stats.lookup_requests})")
+        print(f"[RaidenOffload] Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Queries: {stats.lookup_requests})", flush=True)
         
         num_matched_for_scheduler = num_matched_tokens
         if num_matched_tokens > 0 and num_matched_tokens == request.num_tokens:
