@@ -426,12 +426,13 @@ class RaidenOffloadConnectorScheduler:
                 )
                 self.staging_buffer_manager.allocate(request.request_id, num_blocks=num_blocks_to_load, usage="load")
 
+        prev_hit_tokens = self._external_cache_hits.get(request.request_id, 0)
         self._external_cache_hits[request.request_id] = num_matched_tokens
         
-        if request.get_num_uncomputed_tokens() == 1 and request.request_id not in self._recorded_metrics_reqs:
-            self._recorded_metrics_reqs.add(request.request_id)
-            hit_tokens = num_hits * self.block_size
-            miss_tokens = max(0, request.num_tokens - hit_tokens)
+        if request.get_num_uncomputed_tokens() > 1:
+            hit_tokens = max(0, num_matched_tokens - prev_hit_tokens)
+            num_batched_blocks = max(1, (request.get_num_uncomputed_tokens() + self.block_size - 1) // self.block_size)
+            miss_tokens = max(0, min(request.get_num_uncomputed_tokens(), num_batched_blocks * self.block_size) - hit_tokens)
             self.metrics_collector.record_cache_hit(hit_tokens)
             self.metrics_collector.record_cache_miss(miss_tokens)
 
