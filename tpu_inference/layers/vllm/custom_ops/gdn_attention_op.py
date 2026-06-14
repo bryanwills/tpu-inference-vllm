@@ -20,8 +20,8 @@ import torch
 from einops import rearrange
 from torchax.interop import jax_view, torch_view
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.gdn_linear_attn import \
-    GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
+    QwenGatedDeltaNetAttention
 
 from tpu_inference import envs
 from tpu_inference.layers.common.gdn_attention import (GdnAttentionConfig,
@@ -29,8 +29,8 @@ from tpu_inference.layers.common.gdn_attention import (GdnAttentionConfig,
 from tpu_inference.layers.common.ragged_gated_delta_rule_wrapper import \
     RaggedGatedDeltaRuleImpl
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.common.utils import \
-    reorder_concatenated_tensor_for_sharding
+from tpu_inference.layers.common.utils import (
+    reorder_concatenated_tensor_for_sharding, truncate_sharded_tensor)
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
@@ -90,6 +90,8 @@ def gdn_attention_core_tpu(
     key_dim = n_kq * d_k
     value_dim = n_v * d_v
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+    dp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA)
+
     j_mixed_qkv = reorder_concatenated_tensor_for_sharding(
         j_mixed_qkv, [key_dim, key_dim, value_dim], tp_size, -1)
     j_conv_weight = reorder_concatenated_tensor_for_sharding(
@@ -116,40 +118,47 @@ def gdn_attention_core_tpu(
     #     requests into lower-index slots after earlier ones finish), the
     #     slot id moves with the request so the kernel still reads/writes
     #     the slot that holds this request's real state.
-    state_indices = jax_view(attn_metadata.mamba_state_indices).astype(
-        jnp.int32)
-
-    # Map tokens to their respective requests
-    q_loc = jax_view(attn_metadata.query_start_loc)
-    distribution = jax_view(attn_metadata.request_distribution)
-    j_seq_lens = jax_view(attn_metadata.seq_lens)
+    state_indices = attn_metadata.mamba_state_indices.astype(jnp.int32)
 
     config = GdnAttentionConfig(
         ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl(
             envs.RAGGED_GATED_DELTA_RULE_IMPL))
     logger.info_once(f"GDN Attention Config: {config}")
 
+    padded_num_reqs_per_dp = attn_metadata.padded_num_reqs // dp_size
+
+    # Slice the state indices to the padded_num_reqs, which is the actual number
+    # of requests padded to the bucket.
+    state_indices_sliced = truncate_sharded_tensor(state_indices,
+                                                   padded_num_reqs_per_dp,
+                                                   dp_size)
+    query_start_loc_sliced = truncate_sharded_tensor(
+        attn_metadata.query_start_loc, padded_num_reqs_per_dp + 1, dp_size)
+    seq_lens_sliced = truncate_sharded_tensor(attn_metadata.seq_lens,
+                                              padded_num_reqs_per_dp, dp_size)
+
     (new_conv_state_extracted,
-     new_recurrent_state), j_output = run_jax_gdn_attention(j_mixed_qkv,
-                                                            j_b,
-                                                            j_a,
-                                                            conv_state_in,
-                                                            recurrent_state,
-                                                            j_conv_weight,
-                                                            j_conv_bias,
-                                                            j_A_log,
-                                                            j_dt_bias,
-                                                            state_indices,
-                                                            q_loc,
-                                                            distribution,
-                                                            j_seq_lens,
-                                                            n_kq,
-                                                            n_v,
-                                                            d_k,
-                                                            d_v,
-                                                            kernel_size,
-                                                            mesh=mesh,
-                                                            config=config)
+     new_recurrent_state), j_output = run_jax_gdn_attention(
+         j_mixed_qkv,
+         j_b,
+         j_a,
+         conv_state_in,
+         recurrent_state,
+         j_conv_weight,
+         j_conv_bias,
+         j_A_log,
+         j_dt_bias,
+         state_indices_sliced,
+         query_start_loc_sliced,
+         attn_metadata.request_distribution,
+         seq_lens_sliced,
+         n_kq,
+         n_v,
+         d_k,
+         d_v,
+         kernel_size,
+         mesh=mesh,
+         config=config)
     if state_len > kernel_size - 1:
         remaining_old_state = conv_state[:, kernel_size - 1:, :]
         new_conv_state = jnp.concatenate(
@@ -163,8 +172,8 @@ def gdn_attention_core_tpu(
     core_attn_out.copy_(torch_view(j_output_flat))
 
 
-@GatedDeltaNetAttention.register_oot
-class VllmGatedDeltaNetAttention(GatedDeltaNetAttention):
+@QwenGatedDeltaNetAttention.register_oot
+class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def forward(
         self,

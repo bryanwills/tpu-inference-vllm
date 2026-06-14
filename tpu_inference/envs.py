@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_NAME: str | None = None
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
+    TPU_MULTIPROCESS_DP: bool = False
     PREFILL_SLICES: str = ""
     DECODE_SLICES: str = ""
     SKIP_JAX_PRECOMPILE: bool = False
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     DRAFT_MODEL_IMPL_TYPE: str = "auto"
     NEW_MODEL_DESIGN: bool = False
     PHASED_PROFILING_DIR: str = ""
+    AGGREGATED_STATS_DIR: str = ""
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
     USE_UNFUSED_MEGABLOCKS: bool = False
@@ -32,6 +34,8 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = ""
+    ATTN_BUCKETIZED_NUM_REQS: bool = False
+    ATTN_CUSTOM_NUM_REQS_BUCKETS: list[int] = []
     LAYOUT_Q_PROJ_AS_NDH: bool = False
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
@@ -41,7 +45,6 @@ if TYPE_CHECKING:
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
     MOE_ALL_GATHER_ACTIVATION_DTYPE: str = ""
-    TPU_MAMBA_SSM_CACHE_DTYPE: str = "bfloat16"
     TPU_OFFLOAD_SKIP_JAX_PRECOMPILE: bool = False
     TPU_OFFLOAD_DECODE_SAVE: bool = False
     TPU_OFFLOAD_NUM_CPU_CHUNKS: int = 1024
@@ -54,6 +57,9 @@ if TYPE_CHECKING:
     MOE_APPROX_TOPK_RECALL_TARGET: float | None = None
     VLLM_TPU_PATCH_MM_EMBEDDINGS: bool = False
     ENABLE_RS_KERNEL: bool = False
+    DP_SCHED_BATCH_PREFILL: bool = False
+    DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
+    ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
 
 
 def env_with_choices(
@@ -103,7 +109,9 @@ def env_with_choices(
     return _get_validated_env
 
 
-def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
+def env_bool(env_name: str,
+             default: bool = False,
+             requires: list[str] | None = None) -> Callable[[], bool]:
     """
     Accepts both numeric strings ("0", "1") and boolean strings
     ("true", "false", "True", "False").
@@ -111,22 +119,32 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
     Args:
         env_name: Name of the environment variable
         default: Default boolean value if not set
+        requires: List of environment variables that must be set if this is True.
     """
 
     def _get_bool_env() -> bool:
         value = os.getenv(env_name)
         if value is None or value == "":
-            return default
-
-        value_lower = value.lower()
-        if value_lower in ("true", "1"):
-            return True
-        elif value_lower in ("false", "0"):
-            return False
+            parsed_value = default
         else:
-            raise ValueError(
-                f"Invalid boolean value '{value}' for {env_name}. "
-                f"Valid options: '0', '1', 'true', 'false', 'True', 'False'.")
+            value_lower = value.lower()
+            if value_lower in ("true", "1"):
+                parsed_value = True
+            elif value_lower in ("false", "0"):
+                parsed_value = False
+            else:
+                raise ValueError(
+                    f"Invalid boolean value '{value}' for {env_name}. "
+                    f"Valid options: '0', '1', 'true', 'false', 'True', 'False'."
+                )
+
+        if parsed_value and requires:
+            for req in requires:
+                if not os.getenv(req):
+                    raise ValueError(
+                        f"{env_name} can only be set if {req} is set.")
+
+        return parsed_value
 
     return _get_bool_env
 
@@ -150,6 +168,25 @@ def env_str_list(env_name: str) -> Callable[[], list[str]]:
     return _get_str_list_env
 
 
+def env_int_list(env_name: str) -> Callable[[], list[int]]:
+    """
+    Accepts a comma-separated string and returns a list of strings.
+
+    Args:
+        env_name: Name of the environment variable
+        default: Default list of strings if not set
+    """
+
+    def _get_int_list_env() -> list[int]:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return []
+
+        return [int(v.strip()) for v in value.split(",")]
+
+    return _get_int_list_env
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # JAX platform selection (e.g., "tpu", "cpu", "proxy", "proxy,cpu")
     "JAX_PLATFORMS":
@@ -168,6 +205,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Backend for multi-host communication on TPU
     "TPU_MULTIHOST_BACKEND":
     env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray"]),
+    # Use vLLM-native multi-process data parallelism (one engine process per
+    # DP rank, single load-balanced API endpoint) instead of tpu-inference's
+    # single-process SPMD data parallelism. Each DP rank is pinned to a
+    # disjoint set of TPU chips. Dense (non-MoE) models only.
+    "TPU_MULTIPROCESS_DP":
+    env_bool("TPU_MULTIPROCESS_DP", default=False),
     # Slice configuration for disaggregated prefill workers
     "PREFILL_SLICES":
     lambda: os.getenv("PREFILL_SLICES", ""),
@@ -235,6 +278,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) else None,
+    # By default, it only use max_reqs for attentions. But if set true, it
+    # will precompile max_reqs to power-of-twos between min and max reqs,
+    # and attention will have the num_reqs closer to actual num_reqs. This
+    # makes attention more efficient for num_reqs less than max_reqs but at
+    # the cost of longer model precompilation time.
+    "ATTN_BUCKETIZED_NUM_REQS":
+    env_bool("ATTN_BUCKETIZED_NUM_REQS"),
+    # ATTN_BUCKETIZED_NUM_REQS set to true but the compilation time is too
+    # long, user can set a list of custom buckets (num_reqs to precompile)
+    # separated by comma. The max_reqs will alwasy be added to the buckets
+    "ATTN_CUSTOM_NUM_REQS_BUCKETS":
+    env_int_list("ATTN_CUSTOM_NUM_REQS_BUCKETS"),
     # dictates whether to layout q-proj as NDH (q-heads, model dim, head dim)
     # or DNH (model dim, q-heads, head dim), which is the default (False)
     "LAYOUT_Q_PROJ_AS_NDH":
@@ -253,18 +308,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES":
     env_str_list("REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES"),
     "RAGGED_GATED_DELTA_RULE_IMPL":
-    env_with_choices("RAGGED_GATED_DELTA_RULE_IMPL", "chunked_jax_pd", [
-        "ref", "chunked_jax_pd", "chunked_kernel_pd", "chunked_kernel_p_jax_d",
-        "chunked_kernel_p_recurrent_kernel_d", "recurrent_kernel_pd"
-    ]),
+    env_with_choices(
+        "RAGGED_GATED_DELTA_RULE_IMPL",
+        "chunked_jax_pd",
+        [
+            "chunked_jax_pd", "chunked_kernel_pd",
+            "chunked_kernel_p_recurrent_kernel_d"
+        ],
+    ),
     "MOE_ALL_GATHER_ACTIVATION_DTYPE":
     lambda: os.getenv("MOE_ALL_GATHER_ACTIVATION_DTYPE", ""),
-    # Override cache_config.mamba_ssm_cache_dtype on TPU. Default "bfloat16"
-    # halves SSM state HBM; set "float32" to opt out, "" to defer to vLLM.
-    # TODO: remove once vLLM MambaDType includes bfloat16
-    # (https://github.com/vllm-project/vllm/pull/41680).
-    "TPU_MAMBA_SSM_CACHE_DTYPE":
-    lambda: os.getenv("TPU_MAMBA_SSM_CACHE_DTYPE", "bfloat16"),
     # kv offload to dram: skip pre-compiling swap-related jax functions
     "TPU_OFFLOAD_SKIP_JAX_PRECOMPILE":
     lambda: bool(int(os.getenv("TPU_OFFLOAD_SKIP_JAX_PRECOMPILE", "0"))),
@@ -289,6 +342,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kv offload to dram: Whether to use unpinned_host for KV cache tensors on host dram.
     "TPU_OFFLOAD_USE_UNPINNED_HOST":
     lambda: bool(int(os.getenv("TPU_OFFLOAD_USE_UNPINNED_HOST", "0"))),
+    "AGGREGATED_STATS_DIR":
+    lambda: os.getenv("AGGREGATED_STATS_DIR", ""),
     # MoE: whether to use approximate top-k for expert selection.
     # Enabling this may speedup the expert selection at the risk of accuracy loss.
     "MOE_APPROX_TOPK":
@@ -307,6 +362,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable hierarchical reduce-scatter kernel for MoE
     "ENABLE_RS_KERNEL":
     env_bool("ENABLE_RS_KERNEL", default=False),
+    # DP scheudler: hold and batch incoming requests (prefills) to
+    # cluster and dispatch prefills together.
+    "DP_SCHED_BATCH_PREFILL":
+    env_bool("DP_SCHED_BATCH_PREFILL", default=True),
+    # DP scheduler: timeout (ms) to force flush pending requests.
+    "DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS":
+    lambda: int(os.getenv("DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS", "30000")),
+    "MLA_XPOSE_N_TILE_SIZE":
+    lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    # Use Onehot+Matmul for permute and unpermute before and after moe
+    # when the batch size <= this threshold. When set to 0, this feature
+    # is effectively disabled.
+    "ONEHOT_MOE_PERMUTE_THRESHOLD":
+    lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "0")),
 }
 
 

@@ -2,12 +2,15 @@
 """
 Implements a few utility functions for the various runners.
 """
+import atexit
 import bisect
 import datetime
 import functools
 import json
 import os
 import shutil
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -54,6 +57,19 @@ class InferencePhase(Enum):
     DECODE_ONLY = 5
 
 
+def _inject_dp_rank_into_filename(fname: str, dp_rank: int) -> str:
+    """Prefix `dp<N>_` to an xplane or trace filename, e.g.
+
+        t1v-n-3312659f-w-0.xplane.pb       -> dp0_t1v-n-3312659f-w-0.xplane.pb
+        t1v-n-3312659f-w-0.trace.json.gz   -> dp0_t1v-n-3312659f-w-0.trace.json.gz
+
+    Used by PhasedBasedProfiler under MPMD so per-DP-rank captures (which
+    otherwise share an identical hostname+worker filename on a single host)
+    can coexist in one `plugins/profile/<ts>/` dir for xprof.
+    """
+    return f"dp{dp_rank}_{fname}"
+
+
 def get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
     res = MIN_NUM_SEQS if x <= MIN_NUM_SEQS else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
@@ -69,6 +85,26 @@ def get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
         num = get_padded_num_reqs_with_upper_limit(num + 1, max_req_size)
     logger.info(f"Prepared request paddings: {paddings}")
     return paddings
+
+
+def get_attn_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
+    """Get num reqs paddings with custom override to reduce compilation time"""
+    if not envs.ATTN_BUCKETIZED_NUM_REQS:
+        reqs = [max_req_size]
+    elif envs.ATTN_CUSTOM_NUM_REQS_BUCKETS:
+        reqs = envs.ATTN_CUSTOM_NUM_REQS_BUCKETS
+    else:
+        reqs = get_req_paddings(min_req_size, max_req_size)
+
+    if max_req_size not in reqs:
+        logger.info(
+            "max_num_reqs must be supported but is not in ATTN_CUSTOM_NUM_REQS_BUCKETS. Adding max_num_reqs to the num_reqs buckets."
+        )
+        reqs.append(max_req_size)
+
+    logger.info(f"Prepared attn request paddings: {reqs}")
+
+    return reqs
 
 
 def get_token_paddings(min_token_size: int, max_token_size: int,
@@ -109,7 +145,7 @@ def get_padded_token_len(paddings: list[int], x: int) -> int:
     """Return the first element in paddings list greater or equal to x.
     """
     index = bisect.bisect_left(paddings, x)
-    assert index < len(paddings)
+    assert index < len(paddings), f"{paddings=}, {x=}"
     return paddings[index]
 
 
@@ -222,6 +258,7 @@ def get_batch_composition_stats(
     num_computed_tokens_per_req = input_batch.num_computed_tokens_cpu[:
                                                                       num_reqs]
 
+    scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
     min_kv_len = float('inf') if num_reqs > 0 else 0
     for i, req_id in enumerate(input_batch.req_ids[:num_reqs]):
         assert req_id is not None
@@ -235,12 +272,20 @@ def get_batch_composition_stats(
             num_computed_tokens_per_req[i])  # Cast from np.int32
         min_kv_len = min(min_kv_len, num_already_computed)
 
+        # When speculative decoding is enabled for this request, the extra
+        # tokens are draft tokens being verified, not chunked prefill tokens.
+        num_spec_tokens = len(scheduled_spec_decode_tokens.get(req_id, ()))
+
         if num_already_computed == 0:
             # Prefill
             num_prefill_tokens += num_scheduled_for_req
         # This means the request is ongoing
         else:
-            if num_scheduled_for_req > 1:
+            if num_spec_tokens > 0:
+                # Verifying draft tokens for an ongoing request — count the
+                # target token plus the draft tokens as decode.
+                num_decode_tokens += num_scheduled_for_req
+            elif num_scheduled_for_req > 1:
                 # It's a multi-token request, so it's chunked prefill
                 num_prefill_tokens += num_scheduled_for_req
             else:
@@ -295,30 +340,157 @@ def determine_phase_from_batch_composition_stats(
     return InferencePhase.AMBIGUOUS
 
 
+class AggregatedStatsLogger:
+    """
+    Logs batch composition stats continuously for all steps to a file and
+    periodically flushes them to GCS if required.
+
+    Args:
+        profile_dir: The directory where the profile stats should be saved (local or GCS).
+        flush_interval: The number of steps between flushes to storage.
+    """
+
+    def __init__(self, profile_dir: str, flush_interval: int = 100):
+        self.profile_dir = profile_dir
+        self.flush_interval = flush_interval
+        self.step_count = 0
+
+        now = datetime.datetime.now()
+        date_string = now.strftime("%Y_%m_%d_%H_%M_%S")
+        filename = f"all_batches_stats_{date_string}.jsonl"
+        self.local_temp_file, self.target_file = \
+            self._get_local_and_target_paths(self.profile_dir, filename)
+
+        self._f_local = open(self.local_temp_file, "w")
+        self._f_tmp = open(
+            os.path.join(tempfile.gettempdir(), "all_batches_stats.jsonl"),
+            "w")
+
+        logger.info(
+            f"Initialized AggregatedStatsLogger with output path: {self.target_file}"
+        )
+        atexit.register(self.close)
+
+    def _get_local_and_target_paths(self, base_dir: str,
+                                    filename: str) -> tuple[str, str]:
+        """Helper to resolve local temp path vs final target path (e.g. for GCS)."""
+        target = os.path.join(base_dir, filename)
+        if base_dir.startswith("gs://"):
+            return os.path.join(tempfile.gettempdir(), filename), target
+        os.makedirs(base_dir, exist_ok=True)
+        return target, target
+
+    def _sync_to_gcs(self,
+                     local_file: str,
+                     target_file: str,
+                     blocking: bool = False) -> None:
+        """Helper to sync local file to GCS using the Python SDK."""
+        if target_file.startswith("gs://") and os.path.exists(local_file):
+
+            def _upload():
+                try:
+                    from google.cloud import storage  # type: ignore
+                    client = storage.Client()
+                    # e.g., gs://my-bucket/path/to/file.txt -> ("my-bucket", "path/to/file.txt")
+                    bucket_name, blob_name = target_file[5:].split("/", 1)
+                    client.bucket(bucket_name).blob(
+                        blob_name).upload_from_filename(local_file)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to upload {local_file} to {target_file}: {e}",
+                        exc_info=True)
+
+            if blocking:
+                _upload()
+            else:
+                threading.Thread(target=_upload, daemon=True).start()
+
+    def log(self, batch_composition_stats: dict) -> None:
+        """
+        Logs a single batch's composition statistics to local temporary files.
+        Automatically triggers a flush to storage if the step count reaches the flush interval.
+
+        Args:
+            batch_composition_stats: A dictionary containing the composition statistics
+                for the current batch.
+        """
+        stats_json = json.dumps(batch_composition_stats) + "\n"
+        self._f_local.write(stats_json)
+        self._f_tmp.write(stats_json)
+
+        self.step_count += 1
+        if self.step_count % self.flush_interval == 0:
+            self.flush()
+
+    def flush(self, blocking: bool = False) -> None:
+        """
+        Flushes the current buffered logs to local disk and syncs to Google Cloud Storage (GCS)
+        if the target profile directory is a GCS URI.
+
+        Args:
+            blocking: If True, waits for the GCS sync subprocess to finish before returning.
+        """
+        self._f_local.flush()
+        self._f_tmp.flush()
+        if self.target_file.startswith("gs://") and os.path.exists(
+                self.local_temp_file):
+            logger.info(
+                f"Syncing continuous batch stats to {self.target_file} (Step {self.step_count})..."
+            )
+            self._sync_to_gcs(self.local_temp_file,
+                              self.target_file,
+                              blocking=blocking)
+
+    def close(self) -> None:
+        """
+        Closes the file handles, ensuring a final blocking flush to storage.
+        If syncing to GCS, cleans up the local temporary file.
+        """
+        self.flush(blocking=True)
+        self._f_local.close()
+        self._f_tmp.close()
+        if self.profile_dir.startswith("gs://") and os.path.exists(
+                self.local_temp_file):
+            try:
+                os.remove(self.local_temp_file)
+            except OSError:
+                pass
+
+
 class PhasedBasedProfiler:
     """
     Implements a phased-based profiler, which will profile three phases:
         1. Prefill heavy
         2. Decode heavy
         3. Balanced
+        4. Prefill Only
+        5. Decode  Only
 
     A phase is determined based on the ratio of prefill tokens to total scheduled
     tokens for the given batch (see `determine_phase_from_batch_composition_stats`).
 
     Args:
         profile_dir: The directory to save the profiles to.
+        worker_rank: The rank of the current worker process.
+        flush_interval: The number of steps between continuous logger flushes to storage.
 
     Attributes:
         profiling_n_steps_left: The number of steps left to profile for the current phase.
         profile_dir_with_phase_suffix: The directory to save the profiles to.
         num_steps_to_profile_for: The number of steps to profile for each phase.
+        num_decode_steps_to_skip: The number of decode steps to skip before profiling.
+        decode_steps_skipped: The number of decode steps skipped so far.
         profile_dir: The directory to save the profiles to.
         inference_phase_seen: A dictionary that keeps track of whether a given phase has been seen.
         default_profiling_options: The default profiling options.
         current_phase: The current phase.
+        worker_rank: The rank of the current worker process.
     """
 
-    def __init__(self, profile_dir: str):
+    def __init__(self,
+                 profile_dir: str,
+                 worker_rank: int = 0,
+                 flush_interval: int = 100):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: str = None
         self.num_steps_to_profile_for: int = int(
@@ -342,8 +514,16 @@ class PhasedBasedProfiler:
         }
         self.default_profiling_options = jax.profiler.ProfileOptions()
         self.default_profiling_options.python_tracer_level = envs.PYTHON_TRACER_LEVEL
+        self.default_profiling_options.advanced_configuration = {
+            "tpu_trace_mode": "TRACE_COMPUTE",
+            "tpu_num_sparse_cores_to_trace": 1,
+            "tpu_num_sparse_core_tiles_to_trace": 1,
+        }
 
         self.current_phase: str = ""
+
+        self.worker_rank = worker_rank
+        self.aggregated_stats_logger = None
 
         logger.info(
             "Phased-based profiler enabled. Traces will be saved to: %s",
@@ -378,12 +558,14 @@ class PhasedBasedProfiler:
 
         Args:
             batch_composition_stats: The batch composition stats,  which is a dict
-                containig:
+                containing:
+                    batch_id: The sequential id of the batch.
                     total_num_scheduled_tokens: The total number of tokens scheduled for the batch.
                     num_prefill_tokens: The number of prefill tokens.
                     num_decode_tokens: The number of decode tokens.
                     padded_total_num_scheduled_tokens: The padded total number of tokens scheduled for the batch.
                     num_reqs: The number of requests in the batch.
+                    phase: The phase of the inference the batch is in.
         """
         current_determined_phase = determine_phase_from_batch_composition_stats(
             batch_composition_stats)
@@ -417,10 +599,16 @@ class PhasedBasedProfiler:
 
             logger.info(f"Starting profiling for {self.current_phase} phase")
             logger.info(f"Batch composition stats: {batch_composition_stats}")
-            self.profile_dir_with_phase_suffix = os.path.join(
-                self.profile_dir, self.current_phase)
+            phase_dir = os.path.join(self.profile_dir, self.current_phase)
+            os.makedirs(phase_dir, exist_ok=True)
 
-            # Create the profile subdirectory if it doesn't exist
+            # Resolve the canonical destination ts before start_trace so all
+            # DP ranks land in the same <phase>/plugins/profile/<ts>/ dir
+            # when capture is moved out of the sandbox.
+            self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
+
+            self.profile_dir_with_phase_suffix = os.path.join(
+                phase_dir, f"dp_rank_{self.worker_rank}")
             os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
 
             # Write the batch composition stats to a file to make it easier to
@@ -440,12 +628,14 @@ class PhasedBasedProfiler:
 
         Args:
             batch_composition_stats: The batch composition stats,  which is a dict
-                containig:
+                containing:
+                    batch_id: The sequential id of the batch.
                     total_num_scheduled_tokens: The total number of tokens scheduled for the batch.
                     num_prefill_tokens: The number of prefill tokens.
                     num_decode_tokens: The number of decode tokens.
                     padded_total_num_scheduled_tokens: The padded total number of tokens scheduled for the batch.
                     num_reqs: The number of requests in the batch.
+                    phase: The phase of the inference the batch is in.
         """
         # We only should decrement the profiling_n_steps_left if we are profiling
         if self.current_phase != "":
@@ -454,79 +644,139 @@ class PhasedBasedProfiler:
             self.profiling_n_steps_left -= 1
             if self.profiling_n_steps_left <= 0:
                 jax.profiler.stop_trace()
-                if envs.TPU_MULTIHOST_BACKEND == "ray":
-                    self._merge_multihost_profile_directories()
+                self._merge_profile_directories()
                 logger.info(
                     f"Profiling for {self.current_phase} phase finished")
                 self.current_phase = ""
 
-    def _merge_multihost_profile_directories(self) -> None:
+    # How long non-zero DP ranks will wait for rank 0 to publish the
+    # canonical-ts marker before falling back to their own timestamp.
+    _CANONICAL_TS_POLL_TIMEOUT_S = 5.0
+    _CANONICAL_TS_POLL_INTERVAL_S = 0.05
+
+    def _resolve_canonical_dst_ts(self, phase_dir: str) -> str:
+        """Resolve the canonical destination timestamp for this phase.
+
+        Rank 0 picks the ts (wall clock now) and writes it atomically to a
+        marker file keyed by parent PID; non-zero ranks poll for the marker
+        and read the ts so all ranks end up moving their captures into the
+        same <phase>/plugins/profile/<canonical_ts>/ dir.
+
+        The parent PID in the marker name keeps a current-session marker
+        distinct from any leftover marker from a prior `vllm serve` run
+        sharing the same PHASED_PROFILING_DIR.
         """
-        Merges multi-host JAX profiler timestamp subdirectories that drift due to asynchronous step trigger times.
+        marker = os.path.join(phase_dir, f".canonical_ts_{os.getppid()}")
+        if self.worker_rank == 0:
+            canonical_ts = datetime.datetime.now().strftime(
+                "%Y_%m_%d_%H_%M_%S")
+            marker_tmp = f"{marker}.tmp"
+            with open(marker_tmp, "w") as f:
+                f.write(canonical_ts)
+            os.replace(marker_tmp, marker)
+            return canonical_ts
 
-        Fixes issues where separate host nodes create disjoint timestamp folders due to 1-2 seconds startup
-        skew, which blocks downstream multi-host profile analysis tools (e.g., c2xprof or TensorBoard profile plugins)
-        from recognizing them as a single concurrent distributed profiling session.
+        deadline = time.monotonic() + self._CANONICAL_TS_POLL_TIMEOUT_S
+        while time.monotonic() < deadline:
+            try:
+                with open(marker) as f:
+                    ts = f.read().strip()
+                if ts:
+                    return ts
+            except OSError:
+                pass
+            time.sleep(self._CANONICAL_TS_POLL_INTERVAL_S)
 
-        Example split state before merge:
+        fallback_ts = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        logger.warning(
+            "dp_rank %d did not find rank 0's canonical-ts marker at %s "
+            "within %.1fs; falling back to own timestamp %s — this rank's "
+            "capture will land in a separate ts dir from rank 0's.",
+            self.worker_rank, marker, self._CANONICAL_TS_POLL_TIMEOUT_S,
+            fallback_ts)
+        return fallback_ts
+
+    def _merge_profile_directories(self) -> None:
+        """
+        Consolidates phase trace artifacts so downstream tools (c2xprof,
+        TensorBoard profile plugin, `scripts/merge_xprof.py`) see a single
+        distributed session.
+
+        Two split states are handled in sequence; the function is safe to
+        call from every rank after its own jax.profiler.stop_trace.
+
+        1. MPMD on a single host: each DP rank captured into
+           <phase>/dp_rank_<N>/plugins/profile/<ts>/ with an identically-
+           named xplane.pb (same hostname + same JAX worker id across
+           ranks). Hoist each rank's files up to
+           <phase>/plugins/profile/<ts>/ under TPU_MULTIPROCESS_DP, with
+           `dp<N>` injected into the filename so per-rank captures
+           coexist instead of clobbering each other.
+
+        2. Disjoint timestamp dirs: ray multi-host startup skew (or, after
+           step 1, the per-rank stop_trace timestamps in MPMD) produces
+           multiple <ts>/ subdirs under <phase>/plugins/profile/. Collapse
+           them into the earliest timestamp dir.
+
+        Example multi-host split state before merge:
           .../plugins/profile/2026_05_06_04_47_36/j-1b8d22de-2250-4697-9dfc-ray-node-1-0.xplane.pb
           .../plugins/profile/2026_05_06_04_47_38/j-1b8d22de-2250-4697-9dfc-ray-node-0-0.xplane.pb
-
-        After merge:
-          All host trace artifacts are consolidated under the earliest timestamp folder (2026_05_06_04_47_36/).
+        After merge: both files under 2026_05_06_04_47_36/.
         """
-        profile_path = os.path.join(self.profile_dir_with_phase_suffix,
-                                    "plugins", "profile")
-        if not os.path.exists(profile_path):
+        source_profile_path = os.path.join(self.profile_dir_with_phase_suffix,
+                                           "plugins", "profile")
+        if not os.path.exists(source_profile_path):
             return
+        phase_dir = os.path.dirname(self.profile_dir_with_phase_suffix)
+        dst_ts_dir = os.path.join(phase_dir, "plugins", "profile",
+                                  self._canonical_dst_ts)
         try:
-            # Get all timestamp subdirectories sorted by time
-            dirs = sorted([
-                d for d in os.listdir(profile_path)
-                if os.path.isdir(os.path.join(profile_path, d))
-            ])
-            if len(dirs) <= 1:
-                return
-
-            # Use the earliest directory as the canonical destination target
-            target_dir = os.path.join(profile_path, dirs[0])
-
-            # Move all files from trailing directories into the canonical target directory
-            for src in dirs[1:]:
-                src_dir = os.path.join(profile_path, src)
-                for f in os.listdir(src_dir):
-                    src_file = os.path.join(src_dir, f)
-                    dst_file = os.path.join(target_dir, f)
-                    shutil.move(src_file, dst_file)
+            os.makedirs(dst_ts_dir, exist_ok=True)
+            for ts in os.listdir(source_profile_path):
+                src_ts_dir = os.path.join(source_profile_path, ts)
+                if not os.path.isdir(src_ts_dir):
+                    continue
+                for fname in os.listdir(src_ts_dir):
+                    new_fname = (_inject_dp_rank_into_filename(
+                        fname, self.worker_rank)
+                                 if envs.TPU_MULTIPROCESS_DP else fname)
+                    shutil.move(os.path.join(src_ts_dir, fname),
+                                os.path.join(dst_ts_dir, new_fname))
                 try:
-                    os.rmdir(src_dir)
-                except Exception:
+                    os.rmdir(src_ts_dir)
+                except OSError:
+                    pass
+            for cleanup in (source_profile_path,
+                            os.path.dirname(source_profile_path)):
+                try:
+                    os.rmdir(cleanup)
+                except OSError:
                     pass
             logger.info(
-                "Successfully merged multi-host profile directories into: %s",
-                dirs[0])
+                f"Successfully merged profile directories into: {dst_ts_dir}")
         except Exception as e:
-            logger.warning(
-                "Failed to merge multi-host profile directories: %s", e)
+            logger.warning("Failed to merge profile directories: %s", e)
 
     def step(self, batch_composition_stats: dict) -> None:
         """
-        Steps the profiler.
+        Steps the profiler and logs batch composition stats.
 
         Args:
             batch_composition_stats: The batch composition stats,  which is a dict
-                containig:
+                containing:
+                    batch_id: The sequential id of the batch.
                     total_num_scheduled_tokens: The total number of tokens scheduled for the batch.
                     num_prefill_tokens: The number of prefill tokens.
                     num_decode_tokens: The number of decode tokens.
                     padded_total_num_scheduled_tokens: The padded total number of tokens scheduled for the batch.
                     num_reqs: The number of requests in the batch.
+                    phase: The phase of the inference the batch is in.
         """
+
         have_seen_all_phases = all(self.inference_phase_seen.values())
         # We want to start profiling only after the first trial request
         is_past_initial_request = batch_composition_stats[
-            "num_reqs"] > 1 and batch_composition_stats[
-                "total_num_scheduled_tokens"] > 1
+            "total_num_scheduled_tokens"] > 1
         if is_past_initial_request and (not have_seen_all_phases
                                         or self.current_phase != ""):
             # We haven't started profiling yet
@@ -558,16 +808,14 @@ class SpecDecodeMetadata:
     bonus_logits_indices: jnp.ndarray
     final_logits_indices: jnp.ndarray
 
-    draft_lengths_cpu: Any = field(init=False)
+    draft_lengths_cpu: Any = field(init=False, default=None)
 
 
 def host_extract_sampled_tokens(
         runner, spec_decode_metadata: Optional[SpecDecodeMetadata],
         sampled_output: jnp.ndarray, logits_indices_selector: np.ndarray,
-        discard_sampled_tokens_req_indices: list):
+        discard_sampled_tokens_req_indices: list, num_reqs: int):
     """host retrieve the sampled tokens for the current step."""
-
-    num_reqs = runner.input_batch.num_reqs
     next_tokens = sampled_output
     if spec_decode_metadata is None:
         next_tokens = np.asarray(jax.device_get(next_tokens))

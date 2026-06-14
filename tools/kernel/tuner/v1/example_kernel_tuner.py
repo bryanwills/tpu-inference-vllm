@@ -19,6 +19,8 @@ import random
 import time
 
 from tools.kernel.tuner.v1.common.kernel_tuner_base import (KernelTunerBase,
+                                                            RunConfig,
+                                                            TunerConfig,
                                                             TuningCase,
                                                             TuningStatus)
 
@@ -51,14 +53,15 @@ class ExampleKernelTuner(KernelTunerBase):
     # not based on any real computation, but rather is just a placeholder to
     # demonstrate the tuning pipeline.
 
-    def __init__(self, storage_manager, tpu_queue_multi=None):
-        super().__init__(tuning_key_class=TuningKey,
-                         tunable_params_class=TunableParams,
-                         storage_manager=storage_manager,
-                         job_bucket_size=2,
-                         kernel_tuner_name="example_kernel_tuner",
-                         tpu_queue_multi=tpu_queue_multi
-                         )  # Use a small bucket size for testing
+    def __init__(self, run_config: RunConfig):
+        self.tuner_config = TunerConfig(
+            tuning_key_class=TuningKey,
+            tunable_params_class=TunableParams,
+            kernel_tuner_name="example_kernel_tuner")
+        self.run_config = run_config
+        super().__init__(
+            tuner_config=self.tuner_config,
+            run_config=self.run_config)  # Use a small bucket size for testing
 
     def generate_cases(self) -> list[TuningCase]:
         # Generate some mock tuning cases based on the case_set_id and desc.
@@ -76,14 +79,14 @@ class ExampleKernelTuner(KernelTunerBase):
 
     def generate_inputs(self, tuning_key: TuningKey):
         # Generate some mock inputs for the kernel based on the tuning key.
-        if self._TUNING_KEY and tuning_key == self._TUNING_KEY:
-            return self._KERNEL_INPUTS_CACHE
-        self._TUNING_KEY = tuning_key
-        self._KERNEL_INPUTS_CACHE = {
+        if self._tuning_key and tuning_key == self._tuning_key:
+            return self._kernel_inputs_cache
+        self._tuning_key = tuning_key
+        self._kernel_inputs_cache = {
             'input1': tuning_key.key1,
             'input2': tuning_key.key2
         }
-        return self._KERNEL_INPUTS_CACHE
+        return self._kernel_inputs_cache
 
     def run(self,
             tuning_key: TuningKey,

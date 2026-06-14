@@ -3,7 +3,7 @@ Feature,CorrectnessTest,PerformanceTest
 "DCN-based P/D disaggregation",✅ Passing,✅ Passing
 "KV Cache Offload",✅ Passing,✅ Passing
 "LoRA_Torch",✅ Passing,✅ Passing
-"Multimodal Inputs",❌ Failing,❓ Untested
+"Multimodal Inputs",✅ Passing,✅ Passing
 "Out-of-tree model support",✅ Passing,✅ Passing
 "Prefix Caching",✅ Passing,✅ Passing
 "Single Program Multi Data",✅ Passing,✅ Passing
@@ -16,4 +16,4 @@ Feature,CorrectnessTest,PerformanceTest
 "multi-host",❓ Untested,❓ Untested
 "runai_model_streamer_loader",✅ Passing,❓ Untested
 "sampling_params",✅ Passing,❓ Untested
-"structured_decoding",❌ Failing,❓ Untested
+"structured_decoding",✅ Passing,❓ Untested
