@@ -44,31 +44,35 @@ from tpu_inference import envs
 from tpu_inference.logger import init_logger
 from tpu_inference.offload.metrics import TPUKVCacheMetrics
 from tpu_inference.offload.offload_manager import (CPUChunkPool, CPUChunk,
-                                                   StagingBufferManager)
+                                                   StagingBufferManager,
+                                                   LRUCacheManager)
 from tpu_inference.offload.utils import CpuChunkId, ReqId
 
 logger = init_logger(__name__)
 
 try:
-    from tpu_raiden import KVCacheManager as RaidenKVCacheManager
-    from tpu_raiden import KVCacheStore, RaidenId
+    from tpu_raiden.api.jax.kv_cache_manager import KVCacheManager as RaidenKVCacheManager
+    from tpu_raiden.api.jax.kv_cache_store import KVCacheStore, RaidenId
     _RAIDEN_IMPORT_ERROR = None
-except Exception as _exc:  # pylint: disable=broad-except
-    RaidenKVCacheManager = None
-    KVCacheStore = None
-    RaidenId = None
-    _RAIDEN_IMPORT_ERROR = _exc
+except ImportError:
+    try:
+        from tpu_raiden import KVCacheManager as RaidenKVCacheManager, KVCacheStore, RaidenId
+        _RAIDEN_IMPORT_ERROR = None
+    except Exception as _exc:  # pylint: disable=broad-except
+        RaidenKVCacheManager = None
+        KVCacheStore = None
+        RaidenId = None
+        _RAIDEN_IMPORT_ERROR = _exc
 
 
 def to_raiden_hash(block_hash: BlockHash) -> int:
-    """Converts vLLM BlockHash to a 64-bit signed int for Raiden KVCacheStore."""
+    """Converts vLLM BlockHash to an unsigned 64-bit int for Raiden KVCacheStore."""
     if isinstance(block_hash, int):
-        return block_hash
+        return block_hash % (2**64)
     elif isinstance(block_hash, bytes):
-        val = int.from_bytes(block_hash[:8], byteorder='big')
-        return (val + 2**63) % 2**64 - 2**63
+        return int.from_bytes(block_hash[:8], byteorder='big') % (2**64)
     else:
-        return hash(block_hash)
+        return hash(block_hash) % (2**64)
 
 
 @dataclass
@@ -243,6 +247,14 @@ class RaidenOffloadConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         self.connector_worker.start_load_kv(fwd_ctx)
 
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """TPU connector doesn't support layer-wise load."""
+        pass
+
+    def save_kv_layer(self, **kwargs) -> None:
+        """TPU connector doesn't support layer-wise save."""
+        pass
+
     def wait_for_save(self):
         assert self.connector_worker is not None
         self.connector_worker.wait_for_save()
@@ -260,6 +272,58 @@ class RaidenOffloadConnector(KVConnectorBase_V1):
         if self.connector_worker is None:
             return None
         return self.connector_worker.get_kv_connector_stats()
+
+
+class RaidenLRUCacheManager(LRUCacheManager):
+    """Extends LRUCacheManager to synchronize C++ Raiden KVCacheStore deletions upon local CPU chunk eviction."""
+
+    def __init__(self, num_cpu_chunks: int, kv_store: KVCacheStore):
+        super().__init__(num_cpu_chunks)
+        self.kv_store = kv_store
+
+    def allocate_for_save(
+        self, chunk_hashes: list[int]
+    ) -> Optional[Tuple[list[CPUChunk], list[int]]]:
+        num_chunks = len(chunk_hashes)
+        new_chunk_idxs = [
+            i for i in range(num_chunks)
+            if chunk_hashes[i] not in self.cpu_cache
+        ]
+
+        num_new_chunks = len(new_chunk_idxs)
+        if num_new_chunks == 0:
+            return None
+        num_chunks_to_evict = max(
+            0, num_new_chunks - self.chunk_pool.num_free_chunks)
+
+        to_evict = []
+        if num_chunks_to_evict > 0:
+            for chunk_hash, chunk in self.cpu_cache.items():
+                if chunk.is_ready_to_evict:
+                    to_evict.append(chunk_hash)
+                    num_chunks_to_evict -= 1
+                    if num_chunks_to_evict == 0:
+                        break
+            else:
+                return None
+
+        for evicting_chunk_hash in to_evict:
+            evicting_chunk = self.cpu_cache.pop(evicting_chunk_hash)
+            self.chunk_pool.release_chunk(evicting_chunk)
+            if self.kv_store is not None:
+                self.kv_store.delete([evicting_chunk_hash], [[]])
+
+        new_chunk_hashes = [chunk_hashes[i] for i in new_chunk_idxs]
+        try:
+            new_chunks = self.chunk_pool.allocate_chunks(new_chunk_hashes)
+            assert len(new_chunks) == len(new_chunk_hashes)
+        except Exception as e:
+            logger.warning(f"Failed to allocate {len(new_chunk_hashes)}: {e}")
+            return None
+        
+        for chunk_hash, chunk in zip(new_chunk_hashes, new_chunks):
+            self.cpu_cache[chunk_hash] = chunk
+        return new_chunks, new_chunk_idxs
 
 
 class RaidenOffloadConnectorScheduler:
@@ -281,7 +345,8 @@ class RaidenOffloadConnectorScheduler:
         logger.info(f"Raiden Scheduler Locator baseline: job={self.job_name}, replica={self.job_replica_id}, data={self.data_name}")
 
         self.kv_store = KVCacheStore(capacity=self.num_cpu_chunks)
-        self.chunk_pool = CPUChunkPool(self.num_cpu_chunks)
+        self.lru_manager = RaidenLRUCacheManager(self.num_cpu_chunks, self.kv_store)
+        self.chunk_pool = self.lru_manager.chunk_pool
         
         self.num_staging_blocks = envs.TPU_OFFLOAD_NUM_STAGING_BLOCKS
         self.staging_buffer_manager = StagingBufferManager(num_blocks=self.num_staging_blocks)
@@ -312,6 +377,7 @@ class RaidenOffloadConnectorScheduler:
         if num_hits > 0:
             matched_hashes = [m[0] for m in matched]
             self.kv_store.pin(matched_hashes)
+            self.lru_manager.touch(matched_hashes)
         
         num_matched_blocks = num_hits
         num_matched_tokens = num_matched_blocks * self.block_size
@@ -352,6 +418,12 @@ class RaidenOffloadConnectorScheduler:
 
         self._external_cache_hits[request.request_id] = num_matched_tokens
         self.metrics_collector.record_cache_hit(num_matched_tokens)
+        self.metrics_collector.record_cache_miss(request.num_tokens - num_matched_tokens)
+
+        stats = self.metrics_collector.get_cumulative_stats()
+        total_tokens = stats.lookup_hits + stats.lookup_miss
+        hit_rate = (stats.lookup_hits / total_tokens * 100.0) if total_tokens > 0 else 0.0
+        logger.info(f"Cumulative Host Cache Hit Rate: {hit_rate:.2f}% (Hits: {stats.lookup_hits}, Miss: {stats.lookup_miss}, Queries: {stats.lookup_requests})")
         
         num_matched_for_scheduler = num_matched_tokens
         if num_matched_tokens > 0 and num_matched_tokens == request.num_tokens:
@@ -389,6 +461,7 @@ class RaidenOffloadConnectorScheduler:
 
         block_hashes = _request.block_hashes
         raiden_hashes = [to_raiden_hash(h) for h in block_hashes]
+        self.lru_manager.touch(raiden_hashes[:adjusted_num_total_blocks])
 
         has_new_tokens = adjusted_num_total_tokens > tracker.save_watermark
         should_save = False
@@ -417,34 +490,21 @@ class RaidenOffloadConnectorScheduler:
 
             if num_blocks_to_save > 0:
                 hashes_to_save = raiden_hashes[num_skip_leading_blocks:adjusted_num_total_blocks]
-                
-                new_hashes = []
-                new_hash_idxs = []
-                for idx, h in enumerate(hashes_to_save):
-                    if not self.kv_store.lookup([h]):
-                        new_hashes.append(h)
-                        new_hash_idxs.append(idx)
-                
-                num_new = len(new_hashes)
-                if num_new > 0:
-                    try:
-                        allocated_chunks = self.chunk_pool.allocate_chunks(new_hashes)
-                        assert len(allocated_chunks) == num_new
-                    except Exception as e:
-                        logger.warning(f"Failed to allocate CPU chunks from pool for save: {e}")
-                        return None
-                    
-                    dst_chunks = [c.chunk_id for c in allocated_chunks]
-                    # Accurately populate all locator data
+                allocate_output = self.lru_manager.allocate_for_save(hashes_to_save)
+                if allocate_output is not None:
+                    chunks_for_save, new_hash_idxs = allocate_output
+                    num_new = len(chunks_for_save)
+                    dst_chunks = [c.chunk_id for c in chunks_for_save]
                     dst_locators = [RaidenLocator(
                         self.job_name, self.job_replica_id, self.data_name, cid
                     ) for cid in dst_chunks]
-                    
-                    src_block_ids = tracker.block_ids[num_skip_leading_blocks:adjusted_num_total_blocks]
-                    src_blocks = [src_block_ids[idx] for idx in new_hash_idxs]
 
+                    new_hashes = [hashes_to_save[idx] for idx in new_hash_idxs]
                     for h, cid, locator in zip(new_hashes, dst_chunks, dst_locators):
                         self._pending_save_hashes[req_id].append((h, cid, locator))
+
+                    src_block_ids = tracker.block_ids[num_skip_leading_blocks:adjusted_num_total_blocks]
+                    src_blocks = [src_block_ids[idx] for idx in new_hash_idxs]
 
                     save_spec = RaidenSaveSpec(
                         num_skip_leading_tokens=num_skip_leading_tokens,
@@ -536,6 +596,7 @@ class RaidenOffloadConnectorScheduler:
             
             for req_id, saved_chunks in stats.data["finished_save_chunks"].items():
                 self.staging_buffer_manager.free(req_id, usage="save", num_finished_blocks=len(saved_chunks))
+                self.lru_manager.mark_completion(saved_chunks, "save")
                 
                 pending_items = self._pending_save_hashes.get(req_id, [])
                 completed_items = []
@@ -543,7 +604,6 @@ class RaidenOffloadConnectorScheduler:
                     h, cid, locator = item
                     if cid in saved_chunks:
                         if RaidenId is not None and self.kv_store is not None:
-                            # Reconstruct authoritative C++ RaidenId from Python locator
                             raiden_id = locator.to_raiden_id()
                             self.kv_store.insert([h], [[raiden_id]], on_host=True)
                         completed_items.append(item)
@@ -560,6 +620,7 @@ class RaidenOffloadConnectorScheduler:
 
             for req_id, loaded_chunks in stats.data["finished_load_chunks"].items():
                 self.staging_buffer_manager.free(req_id, usage="load", num_finished_blocks=len(loaded_chunks))
+                self.lru_manager.mark_completion(loaded_chunks, "load")
                 for chunk_id in loaded_chunks:
                     self._reqs_being_loaded[req_id].discard(chunk_id)
                 if not self._reqs_being_loaded[req_id]:
@@ -597,7 +658,6 @@ class RaidenOffloadConnectorWorker:
         
         logger.info("Initializing Raiden KVCacheManager on worker.")
         self.raiden_manager = RaidenKVCacheManager(
-            host_arrays=[],
             device_arrays=kv_caches,
             block_size=self.block_size,
             host_blocks_to_allocate=self.num_cpu_chunks,
@@ -676,7 +736,7 @@ class RaidenOffloadConnectorWorker:
         for item in completed:
             self._pending_saves.remove(item)
 
-        return finished_req_ids, set()
+        return set(), set()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         return self.offload_stats.clone_and_reset()

@@ -175,6 +175,26 @@ class TPUKVCacheMetrics:
         self._staging_buffer_usage_blocks = 0
         self._staging_buffer_free_blocks = 0
 
+    def get_cumulative_stats(self) -> TPUKVCacheStats:
+        with self._instance_lock:
+            stats = TPUKVCacheStats(
+                lookup_requests=self._lookup_requests,
+                lookup_hits=self._lookup_hits,
+                lookup_miss=self._lookup_miss,
+                d2h_operations=self._d2h_operations,
+                d2h_bytes=list(self._d2h_bytes),
+                d2h_transfer_latencies=list(self._d2h_transfer_latencies),
+                d2h_transfer_bw=list(self._d2h_transfer_bw),
+                h2d_operations=self._h2d_operations,
+                h2d_bytes=list(self._h2d_bytes),
+                h2d_transfer_latencies=list(self._h2d_transfer_latencies),
+                h2d_transfer_bw=list(self._h2d_transfer_bw),
+                host_memory_usage_bytes=self._host_memory_usage_bytes,
+                staging_buffer_usage_blocks=self._staging_buffer_usage_blocks,
+                staging_buffer_free_blocks=self._staging_buffer_free_blocks,
+            )
+        return stats
+
     def get_stats_and_clear(self) -> TPUKVCacheStats:
         with self._instance_lock:
             stats = TPUKVCacheStats(
@@ -379,6 +399,7 @@ class TPUKVCacheStatsLogger:
     def log_worker(self):
         while not self.shutdown_event.is_set():
             stats = self.metrics.get_stats_and_clear()
+            logger.info(f"Offload Metrics Snapshot: requests={stats.lookup_requests}, hits={stats.lookup_hits}, miss={stats.lookup_miss}, d2h={stats.d2h_operations}, h2d={stats.h2d_operations}")
             self.prometheus_logger.log_stats(stats)
             # wait returns True if the flag is set, False if timeout
             if self.shutdown_event.wait(self.log_interval):
