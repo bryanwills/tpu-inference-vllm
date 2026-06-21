@@ -325,6 +325,7 @@ def compute_per_seq_metadata(
         "kernel_size",
         "decode_tile_size",
         "mixed_tile_size",
+        "zero_initialize_out",
     ),
 )
 def fused_conv1d_gdn(
@@ -349,11 +350,13 @@ def fused_conv1d_gdn(
     *,
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    zero_initialize_out: bool = True,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
     # TODO(kyuyeunk): Support bf16
-    orig_act_dtype = qkv.dtype
-    orig_conv_state_dtype = conv_state.dtype
-    orig_recurrent_state_dtype = recurrent_state.dtype
+    act_out_dtype = qkv.dtype
+    conv_out_dtype = conv_state.dtype
+    recurrent_out_dtype = recurrent_state.dtype
+
     qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
@@ -368,11 +371,11 @@ def fused_conv1d_gdn(
     assert query_start_loc.shape == (num_seqs + 1, )
     assert state_indices.shape == (num_seqs, )
     assert distribution.shape == (3, )
-    act_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_dtype
+    act_in_dtype = qkv.dtype
+    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
-    packing = 4 // act_dtype.itemsize
+    packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
@@ -416,7 +419,7 @@ def fused_conv1d_gdn(
         in_recurrent_state: jax.Array,
         in_act: jax.Array | None,
         mode: configs.GDNMode,
-    ):
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if mode == configs.GDNMode.BATCHED:
             tile_size = decode_tile_size
         else:
@@ -433,7 +436,8 @@ def fused_conv1d_gdn(
             kq_head_dim=d_k,
             v_head_dim=d_v,
             dtypes=configs.Dtypes(
-                act=act_dtype,
+                act_in=act_in_dtype,
+                act_out=act_out_dtype,
                 # compute=jnp.bfloat16.dtype,
                 compute=jnp.float32.dtype,
                 recurrent_state=in_recurrent_state.dtype,
@@ -466,17 +470,15 @@ def fused_conv1d_gdn(
         # Step 7: Handle case where write needs to be done in existing out.
         in_out_spec = None
         input_output_aliases = {len(metadata) + 3: 1, len(metadata) + 4: 2}
+        out_shape = cfgs.get_out_shape()
         if in_act is not None:
+            out_shape = in_act
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata) + 5] = 0
 
         return pl.pallas_call(
             functools.partial(main_kernel, cfgs=cfgs),
-            out_shape=(
-                cfgs.get_out_shape(),
-                in_conv_state,
-                in_recurrent_state,
-            ),
+            out_shape=(out_shape, in_conv_state, in_recurrent_state),
             in_specs=(
                 metadata_spec,
                 hbm_spec,
@@ -499,20 +501,18 @@ def fused_conv1d_gdn(
         )(metadata, qkv, b, a, in_conv_state, in_recurrent_state, in_act,
           weights)
 
+    out_act = None
+    if zero_initialize_out:
+        out_act = jnp.zeros((padded_batch_size, n_v, d_v), act_out_dtype)
+
     out_act, out_conv_state, out_recurrent_state = call_kernel(
-        conv_state, recurrent_state, None, configs.GDNMode.BATCHED)
+        conv_state, recurrent_state, out_act, configs.GDNMode.BATCHED)
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         out_conv_state, out_recurrent_state, out_act, configs.GDNMode.PER_SEQ)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
-    out_act = out_act.astype(orig_act_dtype)
-    out_conv_state = out_conv_state.astype(orig_conv_state_dtype)
+    out_conv_state = out_conv_state.astype(conv_out_dtype)
     out_conv_state = out_conv_state.reshape(conv_state_shape)
-    out_recurrent_state = out_recurrent_state.astype(
-        orig_recurrent_state_dtype)
-
-    last_row = query_start_loc[distribution[-1]]
-    all_rows = jnp.arange(batch_size).reshape(batch_size, 1)
-    out_act = jnp.where(all_rows < last_row, out_act, 0)
+    out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)
 
     return (out_conv_state, out_recurrent_state), out_act

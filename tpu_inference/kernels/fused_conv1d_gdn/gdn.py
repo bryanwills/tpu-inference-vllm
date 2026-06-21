@@ -397,10 +397,10 @@ def recurrent_gdn(
         mask_list.append(iota < real_size[idx])
     mask = jnp.stack(mask_list, axis=0)
 
-    # (seqs, num_kq_heads, chunk, kq_head_dim)
+    # (seqs, num_kq_heads, chunk, 1, kq_head_dim)
     q_compact = jnp.where(mask, q_compact.astype(cfgs.dtypes.compute), 0)
     k_compact = jnp.where(mask, k_compact.astype(cfgs.dtypes.compute), 0)
-    # (seqs, num_v_heads, chunk, v_head_dim)
+    # (seqs, num_v_heads, chunk, 1, v_head_dim)
     v_compact = jnp.where(mask, v_compact.astype(cfgs.dtypes.compute), 0)
 
     a_log = gdn_weights_ref.a_log[...].reshape(1, 1, 1, 1, -1)
@@ -408,7 +408,7 @@ def recurrent_gdn(
     dt_bias = gdn_weights_ref.dt_bias[...].reshape(1, 1, 1, 1, -1)
     dt_bias = dt_bias.astype(cfgs.dtypes.compute)
 
-    # (seqs, num_kq_heads, toks, 1, kq_head_dim)
+    # (seqs, num_kq_heads, chunk, 1, kq_head_dim)
     q_compact = l2_norm(q_compact)
     q_scale = cfgs.kq_head_dim**-0.5
     q_compact *= q_scale

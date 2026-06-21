@@ -40,7 +40,8 @@ class GDNMode(enum.StrEnum):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Dtypes:
-    act: jnp.dtype
+    act_in: jnp.dtype
+    act_out: jnp.dtype
     compute: jnp.dtype
     recurrent_state: jnp.dtype
     conv_state: jnp.dtype
@@ -108,7 +109,7 @@ class GDNConfigs:
     def get_out_shape(self) -> jax.ShapeDtypeStruct:
         return jax.ShapeDtypeStruct(
             (self.batch_size, self.num_v_heads, self.v_head_dim),
-            self.dtypes.act,
+            self.dtypes.act_out,
         )
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
