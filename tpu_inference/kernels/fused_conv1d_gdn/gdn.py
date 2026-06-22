@@ -260,11 +260,9 @@ def chunked_gdn(
     cfgs: configs.GDNConfigs,
 ) -> tuple[jax.Array, jax.Array]:
     mask_dtype = get_mask_dtype(cfgs.dtypes.compute)
-    mask_list = []
-    iota = jax.lax.broadcasted_iota(mask_dtype, (1, cfgs.chunk_size, 1), 1)
-    for idx in range(cfgs.seq_tile_size):
-        mask_list.append(iota < real_size[idx])
-    mask = jnp.stack(mask_list, axis=0)
+    iota = jax.lax.broadcasted_iota(
+        mask_dtype, (cfgs.seq_tile_size, 1, cfgs.chunk_size, 1), 2)
+    mask = iota < real_size.reshape(-1, 1, 1, 1).astype(mask_dtype)
 
     # (seqs, num_kq_heads, chunk, kq_head_dim)
     q_large = jnp.where(mask, q_large.astype(cfgs.dtypes.compute), 0)
@@ -275,10 +273,11 @@ def chunked_gdn(
     b_large = b_large.astype(cfgs.dtypes.compute)
     a_large = a_large.astype(cfgs.dtypes.compute)
 
-    a_log = gdn_weights_ref.a_log[...].reshape(1, 1, 1, -1)
-    a_log = a_log.astype(cfgs.dtypes.compute)
-    dt_bias = gdn_weights_ref.dt_bias[...].reshape(1, 1, 1, -1)
-    dt_bias = dt_bias.astype(cfgs.dtypes.compute)
+    padding_size = cfgs.aligned_num_v_heads - cfgs.num_v_heads
+    a_log = jnp.pad(gdn_weights_ref.a_log[...], ((0, padding_size)))
+    a_log = a_log.reshape(1, 1, 1, -1).astype(cfgs.dtypes.compute)
+    dt_bias = jnp.pad(gdn_weights_ref.dt_bias[...], ((0, padding_size)))
+    dt_bias = dt_bias.reshape(1, 1, 1, -1).astype(cfgs.dtypes.compute)
 
     # NOTE: Any element-wise computations should occur before repeat.
     q_large = l2_norm(q_large)
@@ -290,8 +289,7 @@ def chunked_gdn(
     beta = jax.nn.sigmoid(b_large)
     gating_log = -jnp.exp(a_log) * jax.nn.softplus(a_large + dt_bias)
 
-    # NOTE: Maskout invalid rows to ensure they do not contribute to intra-chunk
-    # computation.
+    # NOTE: Maskout invalid rows to ensure they do not contribute to compute.
     gating_log = jnp.where(mask, gating_log, 0)
     beta = jnp.where(mask, beta, 0)
 
@@ -391,11 +389,9 @@ def recurrent_gdn(
     cfgs: configs.GDNConfigs,
 ) -> tuple[jax.Array, jax.Array]:
     mask_dtype = get_mask_dtype(cfgs.dtypes.compute)
-    mask_list = []
-    iota = jax.lax.broadcasted_iota(mask_dtype, (1, cfgs.chunk_size, 1, 1), 1)
-    for idx in range(cfgs.seq_tile_size):
-        mask_list.append(iota < real_size[idx])
-    mask = jnp.stack(mask_list, axis=0)
+    iota = jax.lax.broadcasted_iota(
+        mask_dtype, (cfgs.seq_tile_size, 1, cfgs.chunk_size, 1, 1), 2)
+    mask = iota < real_size.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
 
     # (seqs, num_kq_heads, chunk, 1, kq_head_dim)
     q_compact = jnp.where(mask, q_compact.astype(cfgs.dtypes.compute), 0)
@@ -403,10 +399,14 @@ def recurrent_gdn(
     # (seqs, num_v_heads, chunk, 1, v_head_dim)
     v_compact = jnp.where(mask, v_compact.astype(cfgs.dtypes.compute), 0)
 
-    a_log = gdn_weights_ref.a_log[...].reshape(1, 1, 1, 1, -1)
-    a_log = a_log.astype(cfgs.dtypes.compute)
-    dt_bias = gdn_weights_ref.dt_bias[...].reshape(1, 1, 1, 1, -1)
-    dt_bias = dt_bias.astype(cfgs.dtypes.compute)
+    b_compact = b_compact.astype(cfgs.dtypes.compute)
+    a_compact = a_compact.astype(cfgs.dtypes.compute)
+
+    padding_size = cfgs.aligned_num_v_heads - cfgs.num_v_heads
+    a_log = jnp.pad(gdn_weights_ref.a_log[...], ((0, padding_size)))
+    a_log = a_log.reshape(1, 1, 1, 1, -1).astype(cfgs.dtypes.compute)
+    dt_bias = jnp.pad(gdn_weights_ref.dt_bias[...], ((0, padding_size)))
+    dt_bias = dt_bias.reshape(1, 1, 1, 1, -1).astype(cfgs.dtypes.compute)
 
     # (seqs, num_kq_heads, chunk, 1, kq_head_dim)
     q_compact = l2_norm(q_compact)
@@ -416,8 +416,10 @@ def recurrent_gdn(
     k_compact_t = fused_transpose_broadcast(k_compact, src_dim=4, dst_dim=3)
 
     beta = jax.nn.sigmoid(b_compact)
-    beta = jnp.where(mask, beta, 0)
     gating_log = -jnp.exp(a_log) * jax.nn.softplus(a_compact + dt_bias)
+
+    # NOTE: Maskout invalid rows to ensure they do not contribute to compute.
+    beta = jnp.where(mask, beta, 0)
     gating_log = jnp.where(mask, gating_log, 0)
     gating_log = jnp.exp(gating_log)
 

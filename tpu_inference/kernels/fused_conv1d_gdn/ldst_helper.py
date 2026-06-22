@@ -205,9 +205,9 @@ def load_activation_as_large(
     for idx in range(cfgs.seq_tile_size):
         q_large, k_large, v_large = load_as_qkv_large(qkv_vmem_ref.at[idx],
                                                       cfgs)
-        q_large_list.append(q_large.astype(cfgs.dtypes.compute))
-        k_large_list.append(k_large.astype(cfgs.dtypes.compute))
-        v_large_list.append(v_large.astype(cfgs.dtypes.compute))
+        q_large_list.append(q_large)
+        k_large_list.append(k_large)
+        v_large_list.append(v_large)
 
     q_large = jnp.stack(q_large_list, axis=0)
     k_large = jnp.stack(k_large_list, axis=0)

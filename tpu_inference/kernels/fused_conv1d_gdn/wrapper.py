@@ -386,8 +386,8 @@ def fused_conv1d_gdn(
     qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a_log = jnp.pad(a_log, ((0, num_v_padding_size)))
-    dt_bias = jnp.pad(dt_bias, ((0, num_v_padding_size)))
+    # a_log = jnp.pad(a_log, ((0, num_v_padding_size)))
+    # dt_bias = jnp.pad(dt_bias, ((0, num_v_padding_size)))
 
     qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
