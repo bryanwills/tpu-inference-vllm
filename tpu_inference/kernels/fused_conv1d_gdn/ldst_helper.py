@@ -144,6 +144,7 @@ def load_and_mask_states(
         is_first_tile = metadata_ref.st_idx_is_first_tile[p_id, idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
+        # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
         hbm_conv_state = conv_state_slot_ref[idx].astype(jnp.float32)
         prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
 
@@ -152,8 +153,7 @@ def load_and_mask_states(
             prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
                                         prev_tile_conv)
 
-        hbm_recurrent_state = recurrent_slot_ref[idx].astype(
-            cfgs.dtypes.compute)
+        hbm_recurrent_state = recurrent_slot_ref[idx]
         prev_recurrent_state = jnp.where(has_initial_state,
                                          hbm_recurrent_state, 0)
 

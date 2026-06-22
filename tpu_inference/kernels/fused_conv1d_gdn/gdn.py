@@ -217,7 +217,7 @@ def chunked_gdn_per_seq(
         u_ws,
         dimension_numbers=(((1, ), (1, )), ((0, ), (0, ))),
         preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
+    )
 
     # (num_v_heads, kq_head_dim, v_head_dim)
     state_updated = state_prev * gating_last

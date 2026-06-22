@@ -438,8 +438,8 @@ def fused_conv1d_gdn(
             dtypes=configs.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,
-                # compute=jnp.bfloat16.dtype,
-                compute=jnp.float32.dtype,
+                compute=jnp.bfloat16.dtype,
+                # compute=jnp.float32.dtype,
                 recurrent_state=in_recurrent_state.dtype,
                 conv_state=in_conv_state.dtype,
             ),
@@ -471,6 +471,9 @@ def fused_conv1d_gdn(
         in_out_spec = None
         input_output_aliases = {len(metadata) + 3: 1, len(metadata) + 4: 2}
         out_shape = cfgs.get_out_shape()
+
+        if in_act is None and zero_initialize_out:
+            in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
             in_out_spec = hbm_spec
@@ -494,19 +497,15 @@ def fused_conv1d_gdn(
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
-                vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+                vmem_limit_bytes=cfgs.get_vmem_limit_bytes(),
             ),
             name=cfgs.get_kernel_name(),
             metadata=cfgs.get_metadata(),
         )(metadata, qkv, b, a, in_conv_state, in_recurrent_state, in_act,
           weights)
 
-    out_act = None
-    if zero_initialize_out:
-        out_act = jnp.zeros((padded_batch_size, n_v, d_v), act_out_dtype)
-
     out_act, out_conv_state, out_recurrent_state = call_kernel(
-        conv_state, recurrent_state, out_act, configs.GDNMode.BATCHED)
+        conv_state, recurrent_state, None, configs.GDNMode.BATCHED)
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         out_conv_state, out_recurrent_state, out_act, configs.GDNMode.PER_SEQ)
 

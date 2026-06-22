@@ -112,6 +112,10 @@ class GDNConfigs:
             self.dtypes.act_out,
         )
 
+    def get_vmem_limit_bytes(self) -> int:
+        tpu_info = pltpu.get_tpu_info()
+        return int(0.8 * tpu_info.vmem_capacity_bytes)
+
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1,
                       self.dim_size)
@@ -127,8 +131,7 @@ class GDNConfigs:
         # tile carry is not needed.
         if self.mode != GDNMode.BATCHED:
             prev_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
-            prev_recurrent_scratch = pltpu.VMEM(recurrent_shape,
-                                                self.dtypes.compute)
+            prev_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
         return dict(
             prev_conv_scratch_ref=prev_conv_scratch,
