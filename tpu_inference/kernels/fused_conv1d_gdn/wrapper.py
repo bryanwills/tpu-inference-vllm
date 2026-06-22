@@ -386,8 +386,6 @@ def fused_conv1d_gdn(
     qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, num_v_padding_size)))
-    # a_log = jnp.pad(a_log, ((0, num_v_padding_size)))
-    # dt_bias = jnp.pad(dt_bias, ((0, num_v_padding_size)))
 
     qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
@@ -438,8 +436,8 @@ def fused_conv1d_gdn(
             dtypes=configs.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,
-                compute=jnp.bfloat16.dtype,
-                # compute=jnp.float32.dtype,
+                # compute=jnp.bfloat16.dtype,
+                compute=jnp.float32.dtype,
                 recurrent_state=in_recurrent_state.dtype,
                 conv_state=in_conv_state.dtype,
             ),
