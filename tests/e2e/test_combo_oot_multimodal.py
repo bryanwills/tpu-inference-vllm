@@ -40,6 +40,7 @@ except ImportError:
     VLLM_INTERFACE_CHECK_AVAILABLE = False
 
 # --- MODULE LEVEL REGISTRATION ---
+# This executes in every process (Main, Subprocess, Worker) that imports this file.
 custom_arch = "My_Inherited_OOT_Multimodal_Model"
 
 
@@ -52,10 +53,19 @@ custom_arch = "My_Inherited_OOT_Multimodal_Model"
 class OOTMultimodalModel(TpuOfficialJaxModel):
     # Unique tag to prove it's our class
     _is_custom_oot_model = True
+    _inference_verified = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print("!!! OOT PLUGIN: Instance Initialized) !!!")
+        # Provenance signature to verify active process execution in logs
+        print(f"!!! OOT PLUGIN: Instance Initialized (PID {os.getpid()}) !!!")
+
+    def __call__(self, *args, **kwargs):
+        # Use class variable to ensure we only print once per process during inference
+        if not OOTMultimodalModel._inference_verified:
+            print(f"!!! OOT INFERENCE START (PID {os.getpid()}) !!!")
+            OOTMultimodalModel._inference_verified = True
+        return super().__call__(*args, **kwargs)
 
 
 # 2. Define the Inspection Shadow Class (Pure Torch)
@@ -102,7 +112,7 @@ def test_oot_multimodal_full_stack_verification():
     Combined E2E Test: OOT Inheritance + Registry Integrity + TPU Inference.
     """
 
-    # --- STATIC REGISTRY VALIDATION (Requirement 2 & 3) ---
+    # --- STATIC REGISTRY VALIDATION (Pre-Engine) ---
     # 1. Verify TPU registry has the real JAX class
     assert _MODEL_REGISTRY[custom_arch] is OOTMultimodalModel
     assert getattr(_MODEL_REGISTRY[custom_arch], "_is_custom_oot_model", False)
@@ -127,6 +137,7 @@ def test_oot_multimodal_full_stack_verification():
     model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
     engine_args = EngineArgs(
         model=model_id,
+        # Redirect vLLM to our custom architecture name
         hf_overrides={"architectures": [custom_arch]},
         max_model_len=4096,
         tensor_parallel_size=_get_tensor_parallel_size(),
@@ -154,7 +165,18 @@ def test_oot_multimodal_full_stack_verification():
     # Initialize Engine.
     llm = LLM(**engine_kwargs)
 
-    # Inference Quality Check (The ultimate proof of JAX logic execution)
+    # --- POST-INIT VERIFICATION (Proving OOT Redirection) ---
+    # 1. Verify ModelConfig has successfully adopted our custom architecture name.
+    assert llm.llm_engine.model_config.architectures == [custom_arch]
+
+    # 2. Final Runtime Registry Check.
+    # Re-confirm the registry inside the main process still points to our custom classes.
+    resolved_cls, _ = ModelRegistry.resolve_model_cls(
+        architectures=[custom_arch], model_config=llm.llm_engine.model_config)
+    assert issubclass(resolved_cls, OOTMultimodalModelShadow)
+    assert getattr(resolved_cls, "_is_custom_oot_model", False)
+
+    # --- INFERENCE QUALITY VERIFICATION ---
     image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
     prompt = ("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
               "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
