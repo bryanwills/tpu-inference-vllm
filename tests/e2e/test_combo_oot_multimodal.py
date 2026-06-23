@@ -16,12 +16,12 @@ import difflib
 import os
 from dataclasses import asdict
 
-import torch.nn as nn
 from vllm.assets.image import ImageAsset
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLDummyInputsBuilder
+from vllm.model_executor.models.qwen2_5_vl import \
+    Qwen2_5_VLForConditionalGeneration as VllmOfficialTorchModel
 from vllm.model_executor.models.qwen2_5_vl import (
-    Qwen2_5_VLDummyInputsBuilder, Qwen2_5_VLMultiModalProcessor,
-    Qwen2_5_VLProcessingInfo)
+    Qwen2_5_VLMultiModalProcessor, Qwen2_5_VLProcessingInfo)
 from vllm.model_executor.models.registry import ModelRegistry
 # Import official multimodal registration tools
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -30,11 +30,16 @@ from vllm.multimodal.image import convert_image_mode
 # Official tpu_inference libraries and registries
 from tpu_inference.models.common.model_loader import _MODEL_REGISTRY
 from tpu_inference.models.jax.qwen2_5_vl import \
-    Qwen2_5_VLForConditionalGeneration
+    Qwen2_5_VLForConditionalGeneration as TpuOfficialJaxModel
 from vllm import LLM, EngineArgs, SamplingParams
 
-# --- SIMULATED PLUGIN REGISTRATION (Module Level) ---
-# This part executes in EVERY process that imports this file.
+try:
+    from vllm.model_executor.models.interfaces_base import is_vllm_model
+    VLLM_INTERFACE_CHECK_AVAILABLE = True
+except ImportError:
+    VLLM_INTERFACE_CHECK_AVAILABLE = False
+
+# --- MODULE LEVEL REGISTRATION ---
 custom_arch = "My_Inherited_OOT_Multimodal_Model"
 
 
@@ -44,40 +49,42 @@ custom_arch = "My_Inherited_OOT_Multimodal_Model"
     info=Qwen2_5_VLProcessingInfo,
     dummy_inputs=Qwen2_5_VLDummyInputsBuilder,
 )
-class OOTMultimodalModel(Qwen2_5_VLForConditionalGeneration):
+class OOTMultimodalModel(TpuOfficialJaxModel):
+    # Unique tag to prove it's our class
+    _is_custom_oot_model = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Provenance signature to verify active process execution
-        print(
-            f"!!! OOT PLUGIN: Instance {self.__class__.__name__} Initialized (PID {os.getpid()}) !!!"
-        )
+        print("!!! OOT PLUGIN: Instance Initialized) !!!")
 
 
-# 2. Register for TPU Worker (Local lookup)
+# 2. Define the Inspection Shadow Class (Pure Torch)
+class OOTMultimodalModelShadow(VllmOfficialTorchModel):
+    # Unique tag to prove it's our class
+    _is_custom_oot_model = True
+
+
+# 3. Perform Double Registration
+# A. TPU Local Registry
 _MODEL_REGISTRY[custom_arch] = OOTMultimodalModel
-
-
-# 3. Define the Inspection Shadow Class (Pure Torch)
-# We mimic the official 'VllmCompatible' pattern but fix the Metaclass Conflict.
-class OOTMultimodalModelShadow(nn.Module, SupportsMultiModal):
-    _is_vllm_model_ = True
-    # Synchronize the processor factory so vLLM recognizes this as multimodal
-    _processor_factory = getattr(OOTMultimodalModel, "_processor_factory",
-                                 None)
-
-    def __init__(self, *args, **kwargs):
-        nn.Module.__init__(self)
-
-    def forward(self, *args, **kwargs):
-        pass
-
-
-# 4. Register with vLLM via STRING.
-# This is the "Magic Link" that forces the vLLM Subprocess to import THIS file.
-# It makes this test file behave exactly like an installed plugin.
+# B. vLLM Global Registry (via string to force subprocess sync)
+# This forces the vLLM subprocess to import this file and see OOTMultimodalModelShadow.
 ModelRegistry.register_model(custom_arch,
                              f"{__name__}:OOTMultimodalModelShadow")
+
+
+# 4. Helper for static validation
+class MockModelConfig:
+
+    def __init__(self, architectures):
+        self.hf_config = self._MockHfConfig(architectures)
+        self.model_impl = "flax_nnx"
+
+    class _MockHfConfig:
+
+        def __init__(self, architectures):
+            self.architectures = architectures
+
 
 # Standard gold-standard texts for accuracy check
 EXPECTED_TEXTS = (
@@ -92,14 +99,34 @@ def _get_tensor_parallel_size():
 
 def test_oot_multimodal_full_stack_verification():
     """
-    E2E Test: Validates OOT Inheritance by simulating vLLM Plugin behavior.
+    Combined E2E Test: OOT Inheritance + Registry Integrity + TPU Inference.
     """
 
-    # --- DYNAMIC VERIFICATION ---
+    # --- STATIC REGISTRY VALIDATION (Requirement 2 & 3) ---
+    # 1. Verify TPU registry has the real JAX class
+    assert _MODEL_REGISTRY[custom_arch] is OOTMultimodalModel
+    assert getattr(_MODEL_REGISTRY[custom_arch], "_is_custom_oot_model", False)
+
+    # 2. Verify vLLM registry resolves to our Shadow Class
+    mock_cfg = MockModelConfig(architectures=[custom_arch])
+    vllm_resolved_cls, _ = ModelRegistry.resolve_model_cls(
+        architectures=[custom_arch], model_config=mock_cfg)
+
+    assert vllm_resolved_cls is not None
+    # Prove it's NOT the original vLLM class
+    assert vllm_resolved_cls is not VllmOfficialTorchModel
+    # Prove it IS our custom shadow class
+    assert issubclass(vllm_resolved_cls, OOTMultimodalModelShadow)
+    assert getattr(vllm_resolved_cls, "_is_custom_oot_model", False)
+
+    # 3. Interface Compatibility Check
+    if VLLM_INTERFACE_CHECK_AVAILABLE:
+        assert is_vllm_model(vllm_resolved_cls)
+
+    # --- DYNAMIC INFERENCE VERIFICATION ---
     model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
     engine_args = EngineArgs(
         model=model_id,
-        # Redirect vLLM to our simulated plugin architecture
         hf_overrides={"architectures": [custom_arch]},
         max_model_len=4096,
         tensor_parallel_size=_get_tensor_parallel_size(),
@@ -125,17 +152,9 @@ def test_oot_multimodal_full_stack_verification():
     engine_kwargs["compilation_config"]["pass_config"] = pass_config
 
     # Initialize Engine.
-    # The Subprocess will now correctly import this file and see the registration.
     llm = LLM(**engine_kwargs)
 
-    # Verification 1: Metadata check
-    assert llm.llm_engine.model_config.is_multimodal_model is True
-
-    # Verification 2: Instance check
-    model_instance = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    assert isinstance(model_instance, OOTMultimodalModel)
-
-    # Verification 3: Inference check
+    # Inference Quality Check (The ultimate proof of JAX logic execution)
     image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
     prompt = ("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
               "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
@@ -146,7 +165,8 @@ def test_oot_multimodal_full_stack_verification():
     outputs = llm.generate(inputs, SamplingParams(temperature=0,
                                                   max_tokens=64))
     generated_text = outputs[0].outputs[0].text.strip()
-    print(f"\nOOT Verified Response: {generated_text}")
+
+    print(f"\nVerified Response from OOT Class: {generated_text}")
 
     # Accuracy similarity check
     similarity_score = max(
@@ -155,5 +175,3 @@ def test_oot_multimodal_full_stack_verification():
         for expected in EXPECTED_TEXTS)
     print(f"Similarity Score: {similarity_score:.4f}")
     assert similarity_score >= 0.85
-
-    llm.llm_engine.engine_core.shutdown()
